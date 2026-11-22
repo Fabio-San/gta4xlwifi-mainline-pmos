@@ -77,7 +77,9 @@ tag such as `v7.3-pmos-YYYYMMDD`. The repository only holds sources, scripts and
 Prebuilt sterile ROM: [Release v7.3-pmos-20261122](https://github.com/Fabio-San/gta4xlwifi-mainline-pmos/releases/tag/v7.3-pmos-20261122)
 (`gta4xlwifi-pmos-7.3-20261122.zip`, SHA256 `f1ed8fb1e823bf52646d033e2a6c989b24b30d5505b3b93ef8d199c245f8e27c`).
 Verify the checksum before flashing. The ROM is prepared from a clean pmOS base
-with the hardware patches applied, but has not been field-tested as a final package.
+with the hardware patches applied, but has **not been field-tested as a final package**.
+If you test it, please follow [TESTING.md](docs/TESTING.md) and report results
+(especially errors) in a GitHub Issue tagged `rom-test`.
 
 See [FLASH.md](docs/FLASH.md) and [STERILE-ROM.md](docs/STERILE-ROM.md).
 
@@ -121,7 +123,8 @@ See [FLASH.md](docs/FLASH.md) and [STERILE-ROM.md](docs/STERILE-ROM.md).
 │   ├── KNOWN_ISSUES.md / KNOWN_ISSUES.it.md
 │   ├── WORKLOG.md / WORKLOG.it.md
 │   ├── AI_WORKFLOW.md / AI_WORKFLOW.it.md
-│   └── STERILE-ROM.md / STERILE-ROM.it.md
+│   ├── STERILE-ROM.md / STERILE-ROM.it.md
+│   └── TESTING.md / TESTING.it.md
 ├── configs/upstream/                   # .config + touch fragment
 ├── patches/upstream/                   # kernel patches
 ├── tools/                              # pmos-init, busybox, adbd, setup-rndis

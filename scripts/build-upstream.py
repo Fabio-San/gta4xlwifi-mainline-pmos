@@ -148,7 +148,12 @@ def main():
     run(['python3', ROOT/'scripts/upstream/prepare-cpufreq-firmware.py'])
     env = os.environ.copy()
     env['PATH'] = str(ROOT/'tools/host/usr/lib/llvm-21/bin')+':'+str(ROOT/'tools/host/usr/bin')+':'+env['PATH']
-    env['BISON_PKGDATADIR'] = str(ROOT/'tools/host/usr/share/bison')
+    # Use the system bison data files (/usr/share/bison) when the bundled
+    # tools/host tree is absent; only the original bring-up machine had it.
+    bison_data = ROOT/'tools/host/usr/share/bison'
+    if not bison_data.exists():
+        bison_data = Path('/usr/share/bison')
+    env['BISON_PKGDATADIR'] = str(bison_data)
     env['KBUILD_BUILD_USER'] = 'linux'
     env['KBUILD_BUILD_HOST'] = 'gta4xl'
     out = ROOT/'build/kernel-upstream'
