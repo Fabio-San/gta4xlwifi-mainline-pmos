@@ -1,0 +1,60 @@
+--- a/drivers/mmc/host/dw_mmc-exynos.c
++++ b/drivers/mmc/host/dw_mmc-exynos.c
+@@ -67,6 +67,9 @@
+ 		.ctrl_type	= DW_MCI_TYPE_EXYNOS5420_SMU,
+ 	}, {
+ 		.compatible	= "samsung,exynos7-dw-mshc",
++		.ctrl_type	= DW_MCI_TYPE_EXYNOS7,
++	}, {
++		.compatible	= "samsung,exynos9610-dw-mshc",
+ 		.ctrl_type	= DW_MCI_TYPE_EXYNOS7,
+ 	}, {
+ 		.compatible	= "samsung,exynos7-dw-mshc-smu",
+@@ -661,6 +664,8 @@
+ 			.data = &exynos_drv_data, },
+ 	{ .compatible = "samsung,exynos7-dw-mshc",
+ 			.data = &exynos_drv_data, },
++	{ .compatible = "samsung,exynos9610-dw-mshc",
++			.data = &exynos_drv_data, },
+ 	{ .compatible = "samsung,exynos7-dw-mshc-smu",
+ 			.data = &exynos_drv_data, },
+ 	{ .compatible = "samsung,exynos7870-dw-mshc",
+--- a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
++++ b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+@@ -23,6 +23,7 @@
+           - samsung,exynos5420-dw-mshc
+           - samsung,exynos5420-dw-mshc-smu
+           - samsung,exynos7-dw-mshc
++          - samsung,exynos9610-dw-mshc
+           - samsung,exynos7-dw-mshc-smu
+           - samsung,exynos7870-dw-mshc
+           - samsung,exynos7870-dw-mshc-smu
+@@ -132,6 +133,7 @@
+               - samsung,exynos5250-dw-mshc
+               - samsung,exynos5420-dw-mshc
+               - samsung,exynos7-dw-mshc
++              - samsung,exynos9610-dw-mshc
+               - samsung,exynos7-dw-mshc-smu
+               - axis,artpec8-dw-mshc
+     then:
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -64,7 +64,7 @@
+ 
+ 	/* Start at 3.3 V / 25 MHz; high-speed tuning and PMIC control follow. */
+ 	mmc: mmc@13550000 {
+-		compatible = "samsung,exynos7-dw-mshc";
++		compatible = "samsung,exynos9610-dw-mshc";
+ 		reg = <0x13550000 0x2000>;
+ 		interrupts = <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
+ 		clocks = <&cmu_fsys CLK_GOUT_FSYS_MMC_CARD_ACLK>,
+@@ -81,7 +81,7 @@
+ 		no-sdio;
+ 		max-frequency = <25000000>;
+ 		samsung,dw-mshc-ciu-div = <3>;
+-		samsung,dw-mshc-sdr-timing = <3 0>;
+-		samsung,dw-mshc-ddr-timing = <3 0>;
++		samsung,dw-mshc-sdr-timing = <0 2>;
++		samsung,dw-mshc-ddr-timing = <1 2>;
+ 	};
+ };

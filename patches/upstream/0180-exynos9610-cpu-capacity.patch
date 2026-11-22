@@ -1,0 +1,113 @@
+From: gta4xl Linux port
+Subject: [PATCH] arm64: exynos9610: describe CPU capacities and shared L2 caches
+
+The CPU nodes lack capacity-dmips-mhz, so generic arch topology falls back
+to capacity 1024 for all eight CPUs and does not enable asymmetric capacity
+balancing. A CPU-bound task released onto all CPUs remains on Cortex-A53.
+
+Carry over the downstream EMS per-MHz capacity ratio of 230:480.
+The generic cpufreq policy notifier combines it with each cluster's
+maximum frequency;
+at the stock 1742/2314 MHz maxima, capacities normalize to 369/1024.
+
+Describe one shared L2 cache per cluster. Without cache identities, generic
+cacheinfo currently reports a single system-wide shared L2. Distinct cache
+phandles let the MC scheduling domain group CPUs 0-3 and 4-7 correctly.
+Only cache sharing and level are needed; sizes are unspecified.
+No clock, voltage, OPP or thermal settings are changed.
+
+diff --git a/arch/arm64/boot/dts/exynos/exynos9610.dtsi b/arch/arm64/boot/dts/exynos/exynos9610.dtsi
+--- a/arch/arm64/boot/dts/exynos/exynos9610.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos9610.dtsi
+@@ -65,9 +65,25 @@
+ 			};
+ 		};
+ 
++		/* Each CPU cluster has its own shared L2, not a system-wide LLC. */
++		l2_a53: l2-cache0 {
++			compatible = "cache";
++			cache-level = <2>;
++			cache-unified;
++		};
++
++		l2_a73: l2-cache1 {
++			compatible = "cache";
++			cache-level = <2>;
++			cache-unified;
++		};
++
+ 		cpu0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
++			/* Downstream Exynos9610 EMS per-MHz capacity. */
++			capacity-dmips-mhz = <230>;
++			next-level-cache = <&l2_a53>;
+ 			reg = <0x0>;
+ 			enable-method = "psci";
+ 		};
+@@ -75,6 +91,9 @@
+ 		cpu1: cpu@1 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
++			/* Downstream Exynos9610 EMS per-MHz capacity. */
++			capacity-dmips-mhz = <230>;
++			next-level-cache = <&l2_a53>;
+ 			reg = <0x1>;
+ 			enable-method = "psci";
+ 		};
+@@ -82,6 +101,9 @@
+ 		cpu2: cpu@2 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
++			/* Downstream Exynos9610 EMS per-MHz capacity. */
++			capacity-dmips-mhz = <230>;
++			next-level-cache = <&l2_a53>;
+ 			reg = <0x2>;
+ 			enable-method = "psci";
+ 		};
+@@ -89,6 +111,9 @@
+ 		cpu3: cpu@3 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
++			/* Downstream Exynos9610 EMS per-MHz capacity. */
++			capacity-dmips-mhz = <230>;
++			next-level-cache = <&l2_a53>;
+ 			reg = <0x3>;
+ 			enable-method = "psci";
+ 		};
+@@ -96,6 +121,8 @@
+ 		cpu100: cpu@100 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a73";
++			capacity-dmips-mhz = <480>;
++			next-level-cache = <&l2_a73>;
+ 			reg = <0x100>;
+ 			enable-method = "psci";
+ 		};
+@@ -103,6 +130,8 @@
+ 		cpu101: cpu@101 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a73";
++			capacity-dmips-mhz = <480>;
++			next-level-cache = <&l2_a73>;
+ 			reg = <0x101>;
+ 			enable-method = "psci";
+ 		};
+@@ -110,6 +139,8 @@
+ 		cpu102: cpu@102 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a73";
++			capacity-dmips-mhz = <480>;
++			next-level-cache = <&l2_a73>;
+ 			reg = <0x102>;
+ 			enable-method = "psci";
+ 		};
+@@ -117,6 +148,8 @@
+ 		cpu103: cpu@103 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a73";
++			capacity-dmips-mhz = <480>;
++			next-level-cache = <&l2_a73>;
+ 			reg = <0x103>;
+ 			enable-method = "psci";
+ 		};

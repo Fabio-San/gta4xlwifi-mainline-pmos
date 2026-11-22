@@ -1,0 +1,1023 @@
+From: gta4xl upstream bring-up
+Subject: [PATCH] gta4xl: SM5713 power, ADC v3 and suspend-to-idle wakeup
+
+Port the board power interfaces from Samsung 4.14 to standard IIO and
+power_supply APIs. Enable touch wake and display system sleep callbacks.
+
+---
+
+diff --git a/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c b/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
+--- a/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
++++ b/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
+@@ -1999,14 +1999,12 @@
+ 		/* pin-controller instance 3 FSYS data */
+ 		.pin_banks	= exynos9610_pin_banks3,
+ 		.nr_banks	= ARRAY_SIZE(exynos9610_pin_banks3),
+-		.suspend	= exynos_pinctrl_suspend,
+-		.resume		= exynos_pinctrl_resume,
++		/* EINT state is uninitialized without eint_gpio_init. */
+ 	}, {
+ 		/* pin-controller instance 4 TOP data */
+ 		.pin_banks	= exynos9610_pin_banks4,
+ 		.nr_banks	= ARRAY_SIZE(exynos9610_pin_banks4),
+-		.suspend	= exynos_pinctrl_suspend,
+-		.resume		= exynos_pinctrl_resume,
++		/* EINT state is uninitialized without eint_gpio_init. */
+ 	}, {
+ 		/* pin-controller instance 5 SHUB data */
+ 		.pin_banks	= exynos9610_pin_banks5,
+diff --git a/Documentation/devicetree/bindings/iio/adc/samsung,exynos9610-adc.yaml b/Documentation/devicetree/bindings/iio/adc/samsung,exynos9610-adc.yaml
+--- /dev/null
++++ b/Documentation/devicetree/bindings/iio/adc/samsung,exynos9610-adc.yaml
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/iio/adc/samsung,exynos9610-adc.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung Exynos9610 shared ADC v3
++
++maintainers:
++  - Linux IIO <linux-iio@vger.kernel.org>
++
++description: |
++  Twelve-channel 12-bit ADC shared with the sensor hub. The second register
++  range contains the AP flag, sensor hub flag and turn word used to arbitrate
++  conversions. This driver polls conversion completion.
++
++properties:
++  compatible:
++    const: samsung,exynos9610-adc
++
++  reg:
++    items:
++      - description: ADC registers
++      - description: Three arbitration words at CMGP SYSREG offset 0x3100
++
++  reg-names:
++    items:
++      - const: adc
++      - const: arbitration
++
++  clocks:
++    maxItems: 1
++
++  clock-names:
++    const: adc
++
++  '#io-channel-cells':
++    const: 1
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - clocks
++  - clock-names
++  - '#io-channel-cells'
++
++additionalProperties: false
+diff --git a/Documentation/devicetree/bindings/power/supply/samsung,gta4xl-sm5713-power.yaml b/Documentation/devicetree/bindings/power/supply/samsung,gta4xl-sm5713-power.yaml
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/supply/samsung,gta4xl-sm5713-power.yaml
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/supply/samsung,gta4xl-sm5713-power.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung gta4xl SM5713 battery and USB charger
++
++maintainers:
++  - Linux Power Management <linux-pm@vger.kernel.org>
++
++description: |
++  Board power integration for the SM-P615 battery, SM5713 charger at I2C
++  address 0x49 and retained fuel gauge at 0x71 on the same bus. The driver
++  uses the gta4xl battery/charger NTC calibration. USB input is limited
++  to 500 mA on ordinary ports and 1500 mA for detected BC1.2 CDP/DCP ports.
++  It polls charger status and temperature and disables charging in sleep
++  when the software thermistor monitor cannot run. USB PD, OTG and AFC are
++  not implemented by this board integration driver.
++
++properties:
++  compatible:
++    const: samsung,gta4xl-sm5713-power
++
++  reg:
++    maxItems: 1
++
++  io-channels:
++    items:
++      - description: Battery NTC raw ADC channel
++      - description: Charger NTC raw ADC channel
++
++  io-channel-names:
++    items:
++      - const: battery-temp
++      - const: charger-temp
++
++required:
++  - compatible
++  - reg
++  - io-channels
++  - io-channel-names
++
++additionalProperties: false
+diff --git a/Documentation/devicetree/bindings/input/touchscreen/himax,hx83102e.yaml b/Documentation/devicetree/bindings/input/touchscreen/himax,hx83102e.yaml
+--- a/Documentation/devicetree/bindings/input/touchscreen/himax,hx83102e.yaml
++++ b/Documentation/devicetree/bindings/input/touchscreen/himax,hx83102e.yaml
+@@ -31,6 +31,8 @@
+   spi-max-frequency:
+     maximum: 7000000
+ 
++  wakeup-source: true
++
+   spi-cpol: true
+   spi-cpha: true
+ 
+diff --git a/drivers/iio/adc/Kconfig b/drivers/iio/adc/Kconfig
+--- a/drivers/iio/adc/Kconfig
++++ b/drivers/iio/adc/Kconfig
+@@ -758,6 +758,16 @@
+ 
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called ep93xx_adc.
++
++config EXYNOS9610_ADC
++	tristate "Samsung Exynos9610 shared ADC"
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	depends on OF
++	help
++	  Support the twelve-channel ADC v3 shared with the sensor hub
++	  on Samsung Exynos9610. This is used by battery and charger
++	  thermistors on the Galaxy Tab S6 Lite. Conversion completion
++	  is polled and access is arbitrated with the sensor hub.
+ 
+ config EXYNOS_ADC
+ 	tristate "Exynos ADC driver support"
+diff --git a/drivers/iio/adc/Makefile b/drivers/iio/adc/Makefile
+--- a/drivers/iio/adc/Makefile
++++ b/drivers/iio/adc/Makefile
+@@ -179,3 +179,5 @@
+ obj-$(CONFIG_XILINX_AMS) += xilinx-ams.o
+ xilinx-xadc-y := xilinx-xadc-core.o xilinx-xadc-events.o
+ obj-$(CONFIG_XILINX_XADC) += xilinx-xadc.o
++
++obj-$(CONFIG_EXYNOS9610_ADC) += exynos9610_adc.o
+diff --git a/drivers/iio/adc/exynos9610_adc.c b/drivers/iio/adc/exynos9610_adc.c
+--- /dev/null
++++ b/drivers/iio/adc/exynos9610_adc.c
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Exynos9610 ADC v3, register protocol from Samsung's GPLv2 driver. */
++#include <linux/clk.h>
++#include <linux/iio/iio.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++
++struct exynos9610_adc {
++	void __iomem *regs;
++	void __iomem *arb;
++	struct clk *clk;
++	/* Serialize conversions and sensor-hub arbitration. */
++	struct mutex lock;
++};
++
++static int exynos9610_adc_read(struct iio_dev *indio,
++		const struct iio_chan_spec *chan, int *val, int *val2, long mask)
++{
++	struct exynos9610_adc *adc = iio_priv(indio);
++	u32 data;
++	int ret;
++
++	if (mask != IIO_CHAN_INFO_RAW)
++		return -EINVAL;
++	mutex_lock(&adc->lock);
++	ret = clk_prepare_enable(adc->clk);
++	if (ret)
++		goto unlock;
++	/* Peterson arbitration with the sensor hub, as in the vendor driver. */
++	writel(1, adc->arb);
++	writel(1, adc->arb + 8);
++	/* Publish the AP request and turn before observing the hub flag. */
++	mb();
++	ret = read_poll_timeout(readl, data,
++		!data || !readl(adc->arb + 8), 100, 100000, false,
++		adc->arb + 4);
++	if (ret)
++		goto release;
++	writel(BIT(2), adc->regs);
++	writel(BIT(1), adc->regs);
++	writel((6 << 4) | chan->channel, adc->regs + 4);
++	writel(0, adc->regs + 0x10);
++	writel(1, adc->regs + 0x14);
++	writel(BIT(1) | BIT(0), adc->regs);
++	ret = readl_poll_timeout(adc->regs + 0x14, data,
++				data & BIT(0), 10, 100000);
++	if (!ret) {
++		*val = readl(adc->regs + 8) & 0xfff;
++		ret = IIO_VAL_INT;
++	}
++	writel(1, adc->regs + 0x14);
++release:
++	writel(0, adc->arb);
++	clk_disable_unprepare(adc->clk);
++unlock:
++	mutex_unlock(&adc->lock);
++	return ret;
++}
++
++#define ADC_CHANNEL(n) { .type = IIO_VOLTAGE, .indexed = 1, .channel = (n), \
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) }
++
++static const struct iio_chan_spec exynos9610_adc_channels[] = {
++	ADC_CHANNEL(0), ADC_CHANNEL(1), ADC_CHANNEL(2), ADC_CHANNEL(3),
++	ADC_CHANNEL(4), ADC_CHANNEL(5), ADC_CHANNEL(6), ADC_CHANNEL(7),
++	ADC_CHANNEL(8), ADC_CHANNEL(9), ADC_CHANNEL(10), ADC_CHANNEL(11),
++};
++
++static const struct iio_info exynos9610_adc_info = {
++	.read_raw = exynos9610_adc_read,
++};
++
++static int exynos9610_adc_probe(struct platform_device *pdev)
++{
++	struct iio_dev *indio;
++	struct exynos9610_adc *adc;
++
++	indio = devm_iio_device_alloc(&pdev->dev, sizeof(*adc));
++	if (!indio)
++		return -ENOMEM;
++	adc = iio_priv(indio);
++	adc->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(adc->regs))
++		return PTR_ERR(adc->regs);
++	adc->arb = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(adc->arb))
++		return PTR_ERR(adc->arb);
++	adc->clk = devm_clk_get(&pdev->dev, "adc");
++	if (IS_ERR(adc->clk))
++		return dev_err_probe(&pdev->dev, PTR_ERR(adc->clk), "ADC clock\n");
++	mutex_init(&adc->lock);
++	indio->name = "exynos9610-adc";
++	indio->modes = INDIO_DIRECT_MODE;
++	indio->info = &exynos9610_adc_info;
++	indio->channels = exynos9610_adc_channels;
++	indio->num_channels = ARRAY_SIZE(exynos9610_adc_channels);
++	return devm_iio_device_register(&pdev->dev, indio);
++}
++
++static const struct of_device_id exynos9610_adc_match[] = {
++	{ .compatible = "samsung,exynos9610-adc" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, exynos9610_adc_match);
++
++static struct platform_driver exynos9610_adc_driver = {
++	.probe = exynos9610_adc_probe,
++	.driver = {
++		.name = "exynos9610-adc",
++		.of_match_table = exynos9610_adc_match,
++	},
++};
++module_platform_driver(exynos9610_adc_driver);
++MODULE_DESCRIPTION("Samsung Exynos9610 shared ADC v3");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -8,6 +8,16 @@
+ 	  (if selected below).
+ 
+ if POWER_SUPPLY
++
++config GTA4XL_SM5713_POWER
++	tristate "Samsung gta4xl SM5713 power support"
++	depends on I2C && IIO
++	select REGMAP_I2C
++	help
++	  Support SM5713 battery reporting and USB charging on the
++	  Samsung Galaxy Tab S6 Lite. Battery and charger thermistors
++	  are monitored through IIO. USB source classification uses the
++	  existing MUIC BC1.2 detection result. Charging pauses in sleep.
+ 
+ config POWER_SUPPLY_DEBUG
+ 	bool "Power supply debug"
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -135,3 +135,5 @@
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
+ obj-$(CONFIG_MACSMC_POWER)	+= macsmc-power.o
+ obj-$(CONFIG_CHARGER_MAX77759)	+= max77759_charger.o
++
++obj-$(CONFIG_GTA4XL_SM5713_POWER) += gta4xl-sm5713.o
+diff --git a/drivers/power/supply/gta4xl-sm5713.c b/drivers/power/supply/gta4xl-sm5713.c
+--- /dev/null
++++ b/drivers/power/supply/gta4xl-sm5713.c
+@@ -0,0 +1,520 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * SM5713 power support for Samsung gta4xl.
++ * Register definitions, conversions and thermistor calibration ported from
++ * Samsung's GPLv2 SM5713/battery_v2 drivers, Copyright (C) 2017 Samsung.
++ * The fuel gauge's retained, factory-calibrated battery model is preserved.
++ */
++#include <linux/i2c.h>
++#include <linux/iio/consumer.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#define SM_STATUS1	0x0d
++#define SM_STATUS2	0x0e
++#define SM_CNTL1	0x13
++#define SM_CNTL2	0x14
++#define SM_VBUSCNTL	0x15
++#define SM_CHGCNTL2	0x18
++#define SM_CHGCNTL4	0x1a
++#define SM_CHGCNTL5	0x1b
++#define SM_WDT		0x22
++#define SM_Q4		BIT(3)
++
++struct gta4xl_power {
++	struct regmap *regmap;
++	struct i2c_client *fg;
++	struct i2c_client *muic;
++	struct iio_channel *therm;
++	struct iio_channel *charger_therm;
++	struct power_supply *battery;
++	struct power_supply *usb;
++	/* Serialize policy changes and userspace register reads. */
++	struct mutex lock;
++	struct delayed_work work;
++	bool thermal_stop;
++	int health;
++	enum power_supply_usb_type usb_type;
++};
++
++/* Board battery NTC: ADC codes ascending, temperatures in 0.1 Celsius. */
++static const int gta4xl_ntc[] = {
++	314, 364, 424, 490, 571, 671, 764, 909, 1051, 1220, 1420, 1596,
++	1781, 2020, 2242, 2477, 2711, 2916, 3126, 3296, 3443, 3538, 3666,
++};
++
++static const int gta4xl_charger_ntc[] = {
++	290, 339, 415, 476, 559, 657, 752, 890, 1032, 1195, 1372, 1564,
++	1772, 1993, 2221, 2475, 2713, 2914, 3109, 3285, 3418, 3554, 3671,
++};
++
++static int gta4xl_read_ntc(struct iio_channel *channel, const int *table,
++			  int count, int *temp)
++{
++	int raw, i, ret;
++
++	ret = iio_read_channel_raw(channel, &raw);
++	if (ret < 0)
++		return ret;
++	/* Rail readings indicate a disconnected or shorted thermistor. */
++	if (raw < table[0] || raw > table[count - 1])
++		return -ERANGE;
++	for (i = 1; i < count; i++) {
++		if (raw <= table[i]) {
++			*temp = 900 - (i - 1) * 50 -
++				(raw - table[i - 1]) * 50 /
++				(table[i] - table[i - 1]);
++			return 0;
++		}
++	}
++	return -ERANGE;
++}
++
++static int gta4xl_temperature(struct gta4xl_power *p, int *temp)
++{
++	return gta4xl_read_ntc(p->therm, gta4xl_ntc, ARRAY_SIZE(gta4xl_ntc), temp);
++}
++
++/* Read the existing BC1.2 result; never initiate AFC/PD or change USB routing. */
++static int gta4xl_source_limit(struct gta4xl_power *p, bool online)
++{
++	enum power_supply_usb_type type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	int detected, input_ma = 500, charge_ma = 500, ret;
++
++	if (online) {
++		detected = i2c_smbus_read_byte_data(p->muic, 0x07);
++		if (detected >= 0) {
++			switch (detected & (BIT(1) | BIT(2) | BIT(3))) {
++			case BIT(1):
++				type = POWER_SUPPLY_USB_TYPE_SDP;
++				break;
++			case BIT(2):
++				type = POWER_SUPPLY_USB_TYPE_DCP;
++				break;
++			case BIT(3):
++				type = POWER_SUPPLY_USB_TYPE_CDP;
++				break;
++			}
++		}
++	}
++	if (type == POWER_SUPPLY_USB_TYPE_CDP || type == POWER_SUPPLY_USB_TYPE_DCP) {
++		input_ma = 1500;
++		charge_ma = 1500;
++	}
++	if (type == p->usb_type)
++		return 0;
++	ret = regmap_update_bits(p->regmap, SM_VBUSCNTL, 0x7f,
++				 (input_ma - 100) / 25);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(p->regmap, SM_CHGCNTL2, 0x7f,
++				 (charge_ma - 100) / 50);
++	if (ret)
++		return ret;
++	p->usb_type = type;
++	dev_info(&p->fg->dev, "USB type %u, input/charge limit %d mA\n", type, input_ma);
++	return 0;
++}
++
++static int gta4xl_charge_off(struct gta4xl_power *p)
++{
++	int ret;
++
++	ret = regmap_update_bits(p->regmap, SM_CNTL1, SM_Q4, 0);
++	if (ret)
++		return ret;
++	return regmap_update_bits(p->regmap, SM_WDT, BIT(0), 0);
++}
++
++static int gta4xl_policy(struct gta4xl_power *p)
++{
++	unsigned int status;
++	int temp, charger_temp, ret;
++
++	ret = gta4xl_temperature(p, &temp);
++	if (!ret)
++		ret = gta4xl_read_ntc(p->charger_therm, gta4xl_charger_ntc,
++				      ARRAY_SIZE(gta4xl_charger_ntc), &charger_temp);
++	if (ret) {
++		p->health = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
++		p->thermal_stop = true;
++		goto stop;
++	}
++	/* Vendor limits: stop at 0/50 C, recover within 5..45 C. */
++	if (temp <= 0 || temp >= 500 || charger_temp >= 800)
++		p->thermal_stop = true;
++	else if (temp >= 50 && temp <= 450 && charger_temp <= 770)
++		p->thermal_stop = false;
++	p->health = temp <= 0 ? POWER_SUPPLY_HEALTH_COLD :
++		(temp >= 500 || charger_temp >= 800) ? POWER_SUPPLY_HEALTH_OVERHEAT :
++		POWER_SUPPLY_HEALTH_GOOD;
++	ret = regmap_read(p->regmap, SM_STATUS1, &status);
++	if (ret)
++		goto stop;
++	ret = gta4xl_source_limit(p, status & BIT(0));
++	if (ret)
++		goto stop;
++	if (status & BIT(2))
++		p->health = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++	if (!(status & BIT(0)) || (status & BIT(2)) || p->thermal_stop)
++		goto stop;
++	ret = regmap_read(p->regmap, SM_STATUS2, &status);
++	if (ret)
++		goto stop;
++	if (status & BIT(7)) {
++		ret = regmap_update_bits(p->regmap, SM_WDT, BIT(6), BIT(6));
++		if (ret)
++			goto stop;
++	}
++	/* Hardware watchdog disables charging if monitoring ever stops. */
++	ret = regmap_update_bits(p->regmap, SM_WDT, 0x0f, BIT(3) | (2 << 1) | 1);
++	if (ret)
++		goto stop;
++	ret = regmap_update_bits(p->regmap, SM_CNTL1, SM_Q4, SM_Q4);
++	if (!ret)
++		return 0;
++stop:
++	if (gta4xl_charge_off(p))
++		return -EIO;
++	return ret;
++}
++
++static int gta4xl_status(struct gta4xl_power *p, int *result)
++{
++	unsigned int s1, s2;
++	int ret;
++
++	ret = regmap_read(p->regmap, SM_STATUS1, &s1);
++	if (ret)
++		return ret;
++	ret = regmap_read(p->regmap, SM_STATUS2, &s2);
++	if (ret)
++		return ret;
++	*result = !(s1 & BIT(0)) ? POWER_SUPPLY_STATUS_DISCHARGING :
++		(s2 & BIT(5)) ? POWER_SUPPLY_STATUS_FULL :
++		(s2 & BIT(3)) ? POWER_SUPPLY_STATUS_CHARGING :
++		POWER_SUPPLY_STATUS_NOT_CHARGING;
++	return 0;
++}
++
++static int gta4xl_battery_get(struct power_supply *psy,
++		enum power_supply_property prop, union power_supply_propval *val)
++{
++	struct gta4xl_power *p = power_supply_get_drvdata(psy);
++	unsigned int status = 0;
++	int raw, ret = 0;
++
++	mutex_lock(&p->lock);
++	switch (prop) {
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = gta4xl_status(p, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = p->health;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		ret = regmap_read(p->regmap, SM_STATUS2, &status);
++		val->intval = !(status & BIT(2));
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		raw = i2c_smbus_read_word_data(p->fg, 0x10);
++		if (raw < 0) {
++			ret = raw;
++			break;
++		}
++		if (!(raw & BIT(4))) {
++			ret = -ENODATA;
++			break;
++		}
++		raw = i2c_smbus_read_word_data(p->fg, 0x05);
++		if (raw < 0)
++			ret = raw;
++		else
++			val->intval = raw & BIT(15) ? 0 : min(raw >> 8, 100);
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
++		raw = i2c_smbus_read_word_data(p->fg,
++			prop == POWER_SUPPLY_PROP_VOLTAGE_NOW ? 0x07 : 0x06);
++		if (raw < 0)
++			ret = raw;
++		else
++			val->intval = (raw & 0x3fff) * 1000000LL / 2048;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		raw = i2c_smbus_read_word_data(p->fg, 0x08);
++		if (raw < 0)
++			ret = raw;
++		else {
++			val->intval = (raw & 0x3fff) * 1000000LL / 2048;
++			if (raw & BIT(15))
++				val->intval = -val->intval;
++		}
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		ret = gta4xl_temperature(p, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = 7040000;
++		break;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = "SM5713 gta4xl";
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	mutex_unlock(&p->lock);
++	return ret;
++}
++
++static int gta4xl_usb_get(struct power_supply *psy,
++		enum power_supply_property prop, union power_supply_propval *val)
++{
++	struct gta4xl_power *p = power_supply_get_drvdata(psy);
++	unsigned int value = 0;
++	int ret;
++
++	mutex_lock(&p->lock);
++	switch (prop) {
++	case POWER_SUPPLY_PROP_USB_TYPE:
++		val->intval = p->usb_type;
++		ret = 0;
++		break;
++	case POWER_SUPPLY_PROP_ONLINE:
++		ret = regmap_read(p->regmap, SM_STATUS1, &value);
++		if (!ret)
++			val->intval = !!(value & BIT(0));
++		break;
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		ret = regmap_read(p->regmap, SM_VBUSCNTL, &value);
++		if (!ret)
++			val->intval = (100 + (value & 0x7f) * 25) * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		ret = regmap_read(p->regmap, SM_CHGCNTL2, &value);
++		if (!ret)
++			val->intval = (100 + min(value & 0x7f, 0x44U) * 50) * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
++		ret = regmap_read(p->regmap, SM_CHGCNTL4, &value);
++		value &= 0x3f;
++		if (!ret)
++			val->intval = (value < 4 ? 3700 + value * 50 :
++				value < 6 ? 3900 + (value - 4) * 100 :
++				4050 + (value - 6) * 10) * 1000;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	mutex_unlock(&p->lock);
++	return ret;
++}
++
++static enum power_supply_property gta4xl_battery_props[] = {
++	POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_PRESENT, POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CAPACITY, POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV, POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_TEMP, POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++};
++
++static enum power_supply_property gta4xl_usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
++};
++
++static const struct power_supply_desc gta4xl_battery_desc = {
++	.name = "sm5713-battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = gta4xl_battery_props,
++	.num_properties = ARRAY_SIZE(gta4xl_battery_props),
++	.get_property = gta4xl_battery_get,
++};
++
++static const struct power_supply_desc gta4xl_usb_desc = {
++	.name = "sm5713-usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
++		     BIT(POWER_SUPPLY_USB_TYPE_SDP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_DCP),
++	.properties = gta4xl_usb_props,
++	.num_properties = ARRAY_SIZE(gta4xl_usb_props),
++	.get_property = gta4xl_usb_get,
++};
++
++static void gta4xl_monitor(struct work_struct *work)
++{
++	struct gta4xl_power *p = container_of(to_delayed_work(work),
++					    struct gta4xl_power, work);
++
++	mutex_lock(&p->lock);
++	if (gta4xl_policy(p))
++		dev_warn_ratelimited(&p->fg->dev, "Charge monitoring failed\n");
++	mutex_unlock(&p->lock);
++	power_supply_changed(p->battery);
++	power_supply_changed(p->usb);
++	schedule_delayed_work(&p->work, msecs_to_jiffies(5000));
++}
++
++static void gta4xl_cleanup(void *data)
++{
++	struct gta4xl_power *p = data;
++
++	cancel_delayed_work_sync(&p->work);
++	gta4xl_charge_off(p);
++}
++
++static int gta4xl_power_probe(struct i2c_client *client)
++{
++	static const struct regmap_config config = {
++		.reg_bits = 8, .val_bits = 8, .max_register = 0x50,
++	};
++	struct power_supply_config psycfg = {};
++	struct gta4xl_power *p;
++	unsigned int id;
++	int ret, fg_id, fg_status;
++
++	if (!i2c_check_functionality(client->adapter,
++		I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA))
++		return -EOPNOTSUPP;
++	p = devm_kzalloc(&client->dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	mutex_init(&p->lock);
++	INIT_DELAYED_WORK(&p->work, gta4xl_monitor);
++	i2c_set_clientdata(client, p);
++	p->health = POWER_SUPPLY_HEALTH_UNKNOWN;
++	p->regmap = devm_regmap_init_i2c(client, &config);
++	if (IS_ERR(p->regmap))
++		return PTR_ERR(p->regmap);
++	ret = regmap_read(p->regmap, 0x50, &id);
++	if (ret)
++		return ret;
++	if ((id & 7) != 1)
++		return -ENODEV;
++	/* Disable charging before acquiring temperature sensors or supplies. */
++	ret = gta4xl_charge_off(p);
++	if (ret)
++		return ret;
++	p->therm = devm_iio_channel_get(&client->dev, "battery-temp");
++	if (IS_ERR(p->therm))
++		return dev_err_probe(&client->dev, PTR_ERR(p->therm), "Battery NTC\n");
++	p->charger_therm = devm_iio_channel_get(&client->dev, "charger-temp");
++	if (IS_ERR(p->charger_therm))
++		return dev_err_probe(&client->dev, PTR_ERR(p->charger_therm), "Charger NTC\n");
++	p->muic = devm_i2c_new_dummy_device(&client->dev, client->adapter, 0x25);
++	if (IS_ERR(p->muic))
++		return PTR_ERR(p->muic);
++	ret = i2c_smbus_read_byte_data(p->muic, 0);
++	if (ret < 0)
++		return ret;
++	if (ret != 1)
++		return -ENODEV;
++	p->fg = devm_i2c_new_dummy_device(&client->dev, client->adapter, 0x71);
++	if (IS_ERR(p->fg))
++		return PTR_ERR(p->fg);
++	fg_id = i2c_smbus_read_word_data(p->fg, 0);
++	if (fg_id < 0)
++		return fg_id;
++	if (fg_id > 0xff)
++		return -ENODEV;
++	fg_status = i2c_smbus_read_word_data(p->fg, 0x10);
++	if (fg_status < 0)
++		return fg_status;
++	if (!(fg_status & BIT(4)))
++		dev_warn(&client->dev, "Gauge model uninitialized; capacity unavailable\n");
++	/* USB default 500 mA. No PD/AFC negotiation or high-current claim. */
++	ret = regmap_update_bits(p->regmap, SM_VBUSCNTL, 0x7f, 16);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(p->regmap, SM_CHGCNTL2, 0x7f, 8);
++	if (ret)
++		return ret;
++	/* 4.35 V board float voltage, hardware auto-stop, 100 mA termination. */
++	ret = regmap_update_bits(p->regmap, SM_CHGCNTL4, 0x7f, 36 | BIT(6));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(p->regmap, SM_CHGCNTL5, 0x1f, 0);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(p->regmap, SM_CNTL2, 0xf, 5);
++	if (ret)
++		return ret;
++	psycfg.drv_data = p;
++	psycfg.fwnode = dev_fwnode(&client->dev);
++	p->battery = devm_power_supply_register(&client->dev,
++					      &gta4xl_battery_desc, &psycfg);
++	if (IS_ERR(p->battery))
++		return PTR_ERR(p->battery);
++	p->usb = devm_power_supply_register(&client->dev,
++					  &gta4xl_usb_desc, &psycfg);
++	if (IS_ERR(p->usb))
++		return PTR_ERR(p->usb);
++	ret = devm_add_action_or_reset(&client->dev, gta4xl_cleanup, p);
++	if (ret)
++		return ret;
++	dev_info(&client->dev, "SM5713 charger %#x, gauge %#x (status %#x), BC1.2 source limits\n",
++		 id, fg_id, fg_status);
++	schedule_delayed_work(&p->work, 0);
++	return 0;
++}
++
++static int gta4xl_power_suspend(struct device *dev)
++{
++	struct gta4xl_power *p = dev_get_drvdata(dev);
++	int ret;
++
++	cancel_delayed_work_sync(&p->work);
++	mutex_lock(&p->lock);
++	/* Software NTC monitoring stops in sleep: stop charging, keep the buck. */
++	ret = gta4xl_charge_off(p);
++	mutex_unlock(&p->lock);
++	if (ret)
++		schedule_delayed_work(&p->work, 0);
++	return ret;
++}
++
++static int gta4xl_power_resume(struct device *dev)
++{
++	struct gta4xl_power *p = dev_get_drvdata(dev);
++
++	schedule_delayed_work(&p->work, 0);
++	return 0;
++}
++
++static void gta4xl_power_shutdown(struct i2c_client *client)
++{
++	gta4xl_cleanup(i2c_get_clientdata(client));
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(gta4xl_power_pm,
++		gta4xl_power_suspend, gta4xl_power_resume);
++
++static const struct of_device_id gta4xl_power_match[] = {
++	{ .compatible = "samsung,gta4xl-sm5713-power" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, gta4xl_power_match);
++
++static struct i2c_driver gta4xl_power_driver = {
++	.probe = gta4xl_power_probe,
++	.shutdown = gta4xl_power_shutdown,
++	.driver = {
++		.name = "gta4xl-sm5713-power",
++		.of_match_table = gta4xl_power_match,
++		.pm = pm_sleep_ptr(&gta4xl_power_pm),
++	},
++};
++module_i2c_driver(gta4xl_power_driver);
++MODULE_DESCRIPTION("Samsung gta4xl SM5713 charger and fuel gauge");
++MODULE_LICENSE("GPL");
+diff --git a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -343,3 +343,54 @@
+ 		dma-coherent;
+ 	};
+ };
++
++/ {
++	oscclk_rco: clock-rco {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <30000000>;
++		clock-output-names = "oscclk_rco";
++	};
++
++	/* I2C1 pins, open drain at 100 kHz until the hardware bus is enabled. */
++	i2c-power {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpp0 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpp0 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		power@49 {
++			compatible = "samsung,gta4xl-sm5713-power";
++			reg = <0x49>;
++			io-channels = <&battery_adc 1>, <&battery_adc 3>;
++			io-channel-names = "battery-temp", "charger-temp";
++		};
++	};
++};
++
++&soc {
++	cmu_cmgp: clock-controller@11c00000 {
++		compatible = "samsung,exynos9610-cmu-cmgp";
++		reg = <0x11c00000 0x8000>;
++		#clock-cells = <1>;
++		clocks = <&oscclk>, <&cmu_apm CLK_GOUT_CMU_CMGP_BUS>;
++		clock-names = "oscclk", "gout_cmu_cmgp_bus";
++	};
++
++	battery_adc: adc@11c30000 {
++		compatible = "samsung,exynos9610-adc";
++		reg = <0x11c30000 0x100>, <0x11c13100 0xc>;
++		reg-names = "adc", "arbitration";
++		clocks = <&cmu_cmgp CLK_GOUT_CMGP_ADC_PCLK_S0>;
++		clock-names = "adc";
++		#io-channel-cells = <1>;
++	};
++};
++
++&touch_spi {
++	touchscreen@0 {
++		wakeup-source;
++	};
++};
+diff --git a/drivers/input/touchscreen/himax_hx83102e.c b/drivers/input/touchscreen/himax_hx83102e.c
+--- a/drivers/input/touchscreen/himax_hx83102e.c
++++ b/drivers/input/touchscreen/himax_hx83102e.c
+@@ -16,6 +16,8 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/pm.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/spi/spi.h>
+ #include <linux/unaligned.h>
+ 
+@@ -187,14 +189,26 @@
+ 	ret = input_register_device(ts->input);
+ 	if (ret)
+ 		return ret;
+-	return devm_request_threaded_irq(dev, spi->irq, NULL, hx83102e_irq,
+-					 IRQF_ONESHOT, dev_name(dev), ts);
++	ret = devm_request_threaded_irq(dev, spi->irq, NULL, hx83102e_irq,
++				       IRQF_ONESHOT, dev_name(dev), ts);
++	if (ret)
++		return ret;
++	if (device_property_read_bool(dev, "wakeup-source")) {
++		ret = devm_device_init_wakeup(dev);
++		if (ret)
++			return ret;
++		return devm_pm_set_wake_irq(dev, spi->irq);
++	}
++	return 0;
+ }
+ 
+ static int hx83102e_suspend(struct device *dev)
+ {
+ 	struct hx83102e *ts = dev_get_drvdata(dev);
+ 
++	/* Keep scanning for touch when this interrupt is a wake source. */
++	if (device_may_wakeup(dev))
++		return 0;
+ 	disable_irq(ts->spi->irq);
+ 	gpiod_set_value_cansleep(ts->reset, 1);
+ 	return 0;
+@@ -204,6 +218,8 @@
+ {
+ 	struct hx83102e *ts = dev_get_drvdata(dev);
+ 
++	if (device_may_wakeup(dev))
++		return 0;
+ 	hx83102e_reset(ts);
+ 	enable_irq(ts->spi->irq);
+ 	return 0;
+diff --git a/drivers/gpu/drm/exynos9610/exynos9610_drm.c b/drivers/gpu/drm/exynos9610/exynos9610_drm.c
+--- a/drivers/gpu/drm/exynos9610/exynos9610_drm.c
++++ b/drivers/gpu/drm/exynos9610/exynos9610_drm.c
+@@ -20,6 +20,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/regmap.h>
+ 
+ #include <drm/drm_atomic_helper.h>
+@@ -31,6 +32,7 @@
+ #include <drm/drm_gem_shmem_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_modes.h>
++#include <drm/drm_modeset_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
+ #include <drm/drm_vblank.h>
+@@ -558,10 +560,11 @@
+ {
+ 	struct exynos9610_drm *priv = bl_get_data(bd);
+ 
+-	return exynos9610_panel_set_brightness(priv, bd->props.brightness);
++	return exynos9610_panel_set_brightness(priv, backlight_get_brightness(bd));
+ }
+ 
+ static const struct backlight_ops exynos9610_backlight_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
+ 	.get_brightness = exynos9610_backlight_get,
+ 	.update_status = exynos9610_backlight_update,
+ };
+@@ -747,6 +750,30 @@
+ 	drm_dev_unregister(&priv->drm);
+ }
+ 
++static int exynos9610_drm_suspend(struct device *dev)
++{
++	struct exynos9610_drm *priv = dev_get_drvdata(dev);
++	int ret;
++
++	ret = drm_mode_config_helper_suspend(&priv->drm);
++	if (ret)
++		return ret;
++	/* Keep DSIM/touch rails alive for touch wake in suspend-to-idle. */
++	decon_writel(priv, DECON_INTERRUPT_ENABLE, 0);
++	decon_writel(priv, DECON_INTERRUPT_PENDING, ~0U);
++	return 0;
++}
++
++static int exynos9610_drm_resume(struct device *dev)
++{
++	struct exynos9610_drm *priv = dev_get_drvdata(dev);
++
++	return drm_mode_config_helper_resume(&priv->drm);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(exynos9610_drm_pm,
++		exynos9610_drm_suspend, exynos9610_drm_resume);
++
+ static const struct of_device_id exynos9610_drm_match[] = {
+ 	{ .compatible = "samsung,exynos9610-dpu" },
+ 	{ }
+@@ -759,6 +786,7 @@
+ 	.driver = {
+ 		.name = "exynos9610-dpu",
+ 		.of_match_table = exynos9610_drm_match,
++		.pm = pm_sleep_ptr(&exynos9610_drm_pm),
+ 	},
+ };
+ module_platform_driver(exynos9610_drm_platform_driver);

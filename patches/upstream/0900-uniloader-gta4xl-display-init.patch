@@ -1,0 +1,237 @@
+diff --git a/Makefile b/Makefile
+index 34e99a4..42857d4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -406,7 +406,10 @@ uniloader-libs := $(patsubst %,%/lib.a, $(uniloader-lib-dirs))
+ uniloader-all := $(uniloader-objs) $(uniloader-libs)
+ 
+ # Linker script dependencies
+-linker-script-deps := $(KERNEL_PATH) $(RAMDISK_PATH)
++linker-script-deps := $(KERNEL_PATH) $(RAMDISK_PATH) $(DT_PATH)
++ifdef CONFIG_GTA4XL_DUAL_BOOT
++linker-script-deps += blob/fallbackImage blob/fallbackDtb blob/fallbackRamdisk
++endif
+ 
+ # ===========================================================================
+ # Build targets
+diff --git a/arch/aarch64/linker.lds.S b/arch/aarch64/linker.lds.S
+index de350f1..accba49 100644
+--- a/arch/aarch64/linker.lds.S
++++ b/arch/aarch64/linker.lds.S
+@@ -17,6 +17,11 @@ TARGET(binary)
+ 
+ INPUT(KERNEL_PATH)
+ INPUT(DTB_PATH)
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++INPUT(blob/fallbackImage)
++INPUT(blob/fallbackDtb)
++INPUT(blob/fallbackRamdisk)
++#endif
+ #ifndef CONFIG_RAMDISK_NO_COPY
+ INPUT(RAMDISK_PATH)
+ #endif
+@@ -50,6 +55,23 @@ SECTIONS
+ 	}
+ #endif
+ 
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++	.fallback_kernel ALIGN(4096) : {
++		fallback_kernel = .;
++		blob/fallbackImage
++	}
++	.fallback_dtb ALIGN(4096) : {
++		fallback_dtb = .;
++		blob/fallbackDtb
++	}
++	.fallback_ramdisk ALIGN(4096) : {
++		fallback_ramdisk = .;
++		blob/fallbackRamdisk
++	}
++	fallback_kernel_size = SIZEOF(.fallback_kernel);
++	fallback_ramdisk_size = SIZEOF(.fallback_ramdisk);
++#endif
++
+ 	.rodata ALIGN(8) : {
+ 		*(.rodata)
+ 		*(.rodata.*)
+diff --git a/arch/aarch64/load-kernel.c b/arch/aarch64/load-kernel.c
+index 8eee041..7833f4a 100644
+--- a/arch/aarch64/load-kernel.c
++++ b/arch/aarch64/load-kernel.c
+@@ -9,6 +9,16 @@
+ 
+ void arch_load_kernel(void* kernel, void* dt, void* ramdisk)
+ {
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++	if (gta4xl_use_fallback) {
++		/* This 4.14 Image has text_offset=0x80000, unlike the 7.3 Image. */
++		memcpy((void *)0x80080000, kernel, (unsigned long)&fallback_kernel_size);
++		__optimized_memcpy((void *)CONFIG_RAMDISK_ENTRY, ramdisk,
++				   (unsigned long)&fallback_ramdisk_size);
++		load_kernel_and_jump(dt, 0, 0, 0, (void *)0x80080000);
++		return;
++	}
++#endif
+ 	memcpy((void*)CONFIG_PAYLOAD_ENTRY, kernel, (unsigned long) &kernel_size);
+ #ifndef CONFIG_RAMDISK_NO_COPY
+ 	__optimized_memcpy((void*)CONFIG_RAMDISK_ENTRY, ramdisk, (unsigned long) &ramdisk_size);
+diff --git a/board/Kconfig b/board/Kconfig
+index 95fa423..2acbc0f 100644
+--- a/board/Kconfig
++++ b/board/Kconfig
+@@ -1,4 +1,18 @@
+ menu "Device Support"
++	config GTA4XL_DUAL_BOOT
++		bool "Embed the working gta4xl kernel as a reset fallback"
++		depends on SAMSUNG_GTA4XL
++		default n
++
++	config GTA4XL_FORCE_FALLBACK
++		bool "Test only the embedded gta4xl fallback"
++		depends on GTA4XL_DUAL_BOOT
++		default n
++
++	config GTA4XL_ATTEMPT_ID
++		hex "Boot attempt tag published to the upstream init"
++		depends on SAMSUNG_GTA4XL
++		default 0x1
+ 	config AMAZON_CHECKERS
+ 		bool "Support for Amazon Echo Show 5 (1st gen)"
+ 		default n
+@@ -480,3 +494,11 @@ menu "Device Specific Addresses"
+ 		default 0x40000000 if NOTHING_TETRIS
+ 		default 0x48000000 if XIAOMI_BEGONIA
+ endmenu
++
++config GTA4XL_FALLBACK_RECOVERY
++	bool "Arm recovery fallback for SM-P615 diagnostic BOOT images"
++	depends on SAMSUNG_GTA4XL
++	default n
++	help
++	  Set Samsung's recovery reboot request before the kernel handoff.
++	  Only use for BOOT-slot experiments with a working original RECOVERY.
+diff --git a/board/samsung/board-gta4xl.c b/board/samsung/board-gta4xl.c
+index dd896e3..846f387 100644
+--- a/board/samsung/board-gta4xl.c
++++ b/board/samsung/board-gta4xl.c
+@@ -7,6 +7,7 @@
+ #include <util.h>
+ #include <drivers/framework.h>
+ #include <lib/simplefb.h>
++#include <soc/exynos9610.h>
+ 
+ static struct video_info gta4xl_fb = {
+ 	.format = FB_FORMAT_ARGB8888,
+@@ -20,8 +21,55 @@ static const struct device gta4xl_devices[] = {
+ 	{ "simplefb", &gta4xl_fb, "fb" },
+ };
+ 
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++int gta4xl_use_fallback;
++#endif
++#ifndef CONFIG_GTA4XL_ATTEMPT_ID
++#define CONFIG_GTA4XL_ATTEMPT_ID 0x1
++#endif
++#define ATTEMPT_TAG (0x4754413400000000UL | CONFIG_GTA4XL_ATTEMPT_ID)
++/* Last 16 bytes of reserved pmsg RAM; survives a warm reset. The tag is
++ * published on every boot so upstream-init can validate the attempt even
++ * when this image has no embedded fallback payload.
++ */
++static void gta4xl_publish_attempt(void)
++{
++	volatile unsigned long *tag = (void *)0xf9f0fff0;
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++	gta4xl_use_fallback = tag[0] == ATTEMPT_TAG && tag[1] == ~ATTEMPT_TAG;
++#ifdef CONFIG_GTA4XL_FORCE_FALLBACK
++	gta4xl_use_fallback = 1;
++#endif
++#endif
++	tag[0] = ATTEMPT_TAG;
++	tag[1] = ~ATTEMPT_TAG;
++	asm volatile("dsb sy" ::: "memory");
++}
++
++static int gta4xl_early_init(void)
++{
++	gta4xl_publish_attempt();
++	/* Keep DECON scanning the bootloader framebuffer during Linux handoff. */
++	*(volatile unsigned int *)(DECON_F_BASE + HW_SW_TRIG_CONTROL) = 0x1281;
++#ifdef CONFIG_GTA4XL_FALLBACK_RECOVERY
++	/* One-shot BOOT tests must return to the untouched recovery image. */
++	*(volatile unsigned int *)0x11860808 =
++		(*(volatile unsigned int *)0x11860808 & ~0x00ff0000U) | 0x004e0000;
++	*(volatile unsigned int *)0x1186080c = 0x12345674;
++	*(volatile unsigned int *)0x11860810 = 0xff;
++#else
++	/* Consume the one-shot recovery request before entering a diagnostic kernel. */
++	if (*(volatile unsigned int *)0x1186080c == 0x12345674)
++		*(volatile unsigned int *)0x1186080c = 0x12345670;
++	if (*(volatile unsigned int *)0x11860810 == 0xff)
++		*(volatile unsigned int *)0x11860810 = 0;
++#endif
++	return 0;
++}
++
+ struct board_data board_ops = {
+ 	.name = "samsung-gta4xl",
++	.ops = { .early_init = gta4xl_early_init },
+ 	.devices = gta4xl_devices,
+ 	.num_devices = ARRAY_SIZE(gta4xl_devices),
+ 	.quirks = 0
+diff --git a/drivers/ramdisk-handler.c b/drivers/ramdisk-handler.c
+index b38aa1d..5d8b2bf 100644
+--- a/drivers/ramdisk-handler.c
++++ b/drivers/ramdisk-handler.c
+@@ -6,12 +6,17 @@
+ #include <drivers/ramdisk-handler.h>
+ #include <lib/debug.h>
+ #include <lib/libfdt/libfdt.h>
++#include <main/boot.h>
+ 
+ int ramdisk_handler_patch_dtb(const void *fdt, void *buf, int bufsize)
+ {
+ 	int ret, dtb_chosen_offset;
+ #ifdef __aarch64__
+ 	void *ramdisk_end = (void*)CONFIG_RAMDISK_ENTRY + (unsigned long)&ramdisk_size;
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++	if (gta4xl_use_fallback)
++		ramdisk_end = (void *)CONFIG_RAMDISK_ENTRY + (unsigned long)&fallback_ramdisk_size;
++#endif
+ #elif __arm__
+ 	void *ramdisk_end = (void*)CONFIG_RAMDISK_ENTRY + ramdisk_size;
+ #endif
+diff --git a/include/main/boot.h b/include/main/boot.h
+index d988e39..a52f519 100644
+--- a/include/main/boot.h
++++ b/include/main/boot.h
+@@ -9,6 +9,11 @@
+ 
+ extern unsigned long kernel_size;
+ extern unsigned long ramdisk_size;
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++extern int gta4xl_use_fallback;
++extern char fallback_kernel[], fallback_dtb[], fallback_ramdisk[];
++extern unsigned long fallback_kernel_size, fallback_ramdisk_size;
++#endif
+ 
+ #ifdef __aarch64__
+ extern void load_kernel_and_jump(void* dtb, void* x1, void* x2, void* x3,
+diff --git a/main/boot.c b/main/boot.c
+index 9fa3010..177d7f8 100644
+--- a/main/boot.c
++++ b/main/boot.c
+@@ -11,6 +11,14 @@
+ 
+ void boot_kernel(void* dt, void* kernel, void* ramdisk)
+ {
++#ifdef CONFIG_GTA4XL_DUAL_BOOT
++	if (gta4xl_use_fallback) {
++		printk(KERN_INFO, "Loading the working Alpine fallback\n");
++		dt = fallback_dtb;
++		kernel = fallback_kernel;
++		ramdisk = fallback_ramdisk;
++	}
++#endif
+ #ifdef CONFIG_LIBFDT
+ 	patch_dtb(&dt);
+ #endif

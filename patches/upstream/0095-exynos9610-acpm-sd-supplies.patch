@@ -1,0 +1,418 @@
+--- /dev/null
++++ b/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/firmware/samsung,exynos9610-acpm-ipc.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung Exynos9610 ACPM firmware interface
++
++maintainers:
++  - linux-samsung-soc@vger.kernel.org
++
++description: |
++  ACPM firmware exposes a PMIC protocol through mailbox doorbells and SRAM
++  queues. The Exynos9610 channel table starts at SRAM offset 0x6f00.
++
++properties:
++  compatible:
++    const: samsung,exynos9610-acpm-ipc
++
++  mboxes:
++    maxItems: 1
++
++  shmem:
++    maxItems: 1
++
++  pmic:
++    $ref: /schemas/regulator/samsung,s2mpu09.yaml#
++
++required:
++  - compatible
++  - mboxes
++  - shmem
++
++additionalProperties: false
+--- a/Documentation/devicetree/bindings/mailbox/google,gs101-mbox.yaml
++++ b/Documentation/devicetree/bindings/mailbox/google,gs101-mbox.yaml
+@@ -23,6 +23,7 @@
+     enum:
+       - google,gs101-mbox
+       - samsung,exynos850-mbox
++      - samsung,exynos9610-mbox
+ 
+   reg:
+     maxItems: 1
+--- /dev/null
++++ b/Documentation/devicetree/bindings/regulator/samsung,s2mpu09.yaml
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/regulator/samsung,s2mpu09.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung S2MPU09 microSD power supplies
++
++maintainers:
++  - linux-samsung-soc@vger.kernel.org
++
++description: |
++  Initial support for LDO2 and LDO35 through ACPM channel 2, Speedy channel 0.
++  Other PMIC functions are left under firmware control.
++
++properties:
++  compatible:
++    const: samsung,s2mpu09-pmic
++
++  regulators:
++    type: object
++    additionalProperties: false
++    properties:
++      ldo2:
++        $ref: regulator.yaml#
++        unevaluatedProperties: false
++      ldo35:
++        $ref: regulator.yaml#
++        unevaluatedProperties: false
++    required:
++      - ldo2
++      - ldo35
++
++required:
++  - compatible
++  - regulators
++
++additionalProperties: false
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -1,9 +1,64 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Diagnostic peripheral enablement; supplies retain the bootloader state. */
++/* Diagnostic peripheral enablement. */
+ #include "exynos9610-gta4xl.dts"
+ #include <dt-bindings/clock/samsung,exynos9610-cmu.h>
+ 
++/ {
++	dll_dco: clock-dll-dco {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <208011000>;
++		clock-output-names = "dll_dco";
++	};
++
++	acpm: power-management {
++		compatible = "samsung,exynos9610-acpm-ipc";
++		mboxes = <&apm_mailbox>;
++		shmem = <&apm_sram>;
++
++		pmic {
++			compatible = "samsung,s2mpu09-pmic";
++
++			regulators {
++				vqmmc: ldo2 {
++					regulator-name = "vqmmc";
++					regulator-min-microvolt = <2900000>;
++					regulator-max-microvolt = <2900000>;
++				};
++
++				vmmc: ldo35 {
++					regulator-name = "vmmc";
++					regulator-min-microvolt = <2900000>;
++					regulator-max-microvolt = <2900000>;
++				};
++			};
++		};
++	};
++};
++
+ &soc {
++	apm_sram: sram@2039000 {
++		compatible = "mmio-sram";
++		reg = <0x02039000 0x15000>;
++	};
++
++	cmu_apm: clock-controller@11800000 {
++		compatible = "samsung,exynos9610-cmu-apm";
++		reg = <0x11800000 0x10000>;
++		#clock-cells = <1>;
++		clocks = <&oscclk>, <&cmu_top CLK_DOUT_CMU_APM_BUS>;
++		clock-names = "oscclk", "dout_cmu_apm_bus";
++	};
++
++	apm_mailbox: mailbox@11900000 {
++		compatible = "samsung,exynos9610-mbox";
++		reg = <0x11900000 0x1000>;
++		clocks = <&cmu_apm CLK_GOUT_APM_MAILBOX_APM2AP_PCLK>;
++		clock-names = "pclk";
++		interrupts = <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH>;
++		#mbox-cells = <0>;
++	};
++
+ 	cmu_top: clock-controller@12100000 {
+ 		compatible = "samsung,exynos9610-cmu-top";
+ 		reg = <0x12100000 0x10000>;
+@@ -62,7 +117,7 @@
+ 			      "dout_cmu_fsys_ufs_embd";
+ 	};
+ 
+-	/* Start at 3.3 V / 25 MHz; high-speed tuning and PMIC control follow. */
++	/* Start at 2.9 V / 25 MHz; high-speed tuning follows. */
+ 	mmc: mmc@13550000 {
+ 		compatible = "samsung,exynos9610-dw-mshc";
+ 		reg = <0x13550000 0x2000>;
+@@ -73,12 +128,15 @@
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&sd2_clk &sd2_cmd &sd2_bus1 &sd2_bus4>;
+ 		bus-width = <4>;
++		vmmc-supply = <&vmmc>;
++		vqmmc-supply = <&vqmmc>;
+ 		fifo-depth = <0x40>;
+ 		broken-cd;
+ 		disable-wp;
+ 		no-1-8-v;
+ 		no-mmc;
+ 		no-sdio;
++		post-power-on-delay-ms = <200>;
+ 		max-frequency = <25000000>;
+ 		samsung,dw-mshc-ciu-div = <3>;
+ 		samsung,dw-mshc-sdr-timing = <0 2>;
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-usb.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-usb.dts
+@@ -9,3 +9,15 @@
+ &cmu_fsys {
+ 	status = "disabled";
+ };
++
++&acpm {
++	status = "disabled";
++};
++
++&apm_mailbox {
++	status = "disabled";
++};
++
++&cmu_apm {
++	status = "disabled";
++};
+--- a/drivers/firmware/samsung/exynos-acpm.c
++++ b/drivers/firmware/samsung/exynos-acpm.c
+@@ -742,6 +742,10 @@
+ 
+ 	platform_set_drvdata(pdev, acpm);
+ 
++	/* The Exynos9610 port currently exposes only the PMIC protocol. */
++	if (!match_data->acpm_clk_dev_name)
++		return devm_of_platform_populate(dev);
++
+ 	acpm_clk_pdev = platform_device_register_data(dev,
+ 						match_data->acpm_clk_dev_name,
+ 						PLATFORM_DEVID_NONE, NULL, 0);
+@@ -883,6 +887,12 @@
+ 
+ static const struct of_device_id acpm_match[] = {
+ 	{
++		.compatible = "samsung,exynos9610-acpm-ipc",
++		.data = &(const struct acpm_match_data) {
++			.initdata_base = 0x6f00,
++		},
++	},
++	{
+ 		.compatible = "google,gs101-acpm-ipc",
+ 		.data = &acpm_gs101,
+ 	},
+--- a/drivers/mailbox/exynos-mailbox.c
++++ b/drivers/mailbox/exynos-mailbox.c
+@@ -129,6 +129,10 @@
+ 
+ static const struct of_device_id exynos_mbox_match[] = {
+ 	{
++		.compatible = "samsung,exynos9610-mbox",
++		.data = &exynos850_mbox_data
++	},
++	{
+ 		.compatible = "google,gs101-mbox",
+ 		.data = &exynos_gs101_mbox_data
+ 	},
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -1896,4 +1896,12 @@
+ 	  boost regulator and IBB can be used as a negative boost regulator
+ 	  for LCD display panel.
+ 
++config REGULATOR_S2MPU09_ACPM
++	tristate "Samsung S2MPU09 SD power supplies over ACPM"
++	depends on EXYNOS_ACPM_PROTOCOL
++	select REGMAP
++	help
++	  Control the LDO2 and LDO35 microSD supplies on Exynos9610 boards
++	  through the ACPM firmware. Other S2MPU09 rails are not managed.
++
+ endif
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -10,6 +10,7 @@
+ obj-$(CONFIG_REGULATOR_FIXED_VOLTAGE) += fixed.o
+ obj-$(CONFIG_REGULATOR_VIRTUAL_CONSUMER) += virtual.o
+ obj-$(CONFIG_REGULATOR_USERSPACE_CONSUMER) += userspace-consumer.o
++obj-$(CONFIG_REGULATOR_S2MPU09_ACPM) += s2mpu09-acpm.o
+ 
+ obj-$(CONFIG_REGULATOR_88PG86X) += 88pg86x.o
+ obj-$(CONFIG_REGULATOR_88PM800) += 88pm800-regulator.o
+--- /dev/null
++++ b/drivers/regulator/s2mpu09-acpm.c
+@@ -0,0 +1,152 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * S2MPU09 microSD supplies, transported through the ACPM PMIC protocol.
++ * Register definitions and voltage tables from Samsung's 2016 S2MPU09 driver.
++ */
++#include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define S2MPU09_ACPM_CHANNEL	2
++#define S2MPU09_PMIC_BANK		1
++#define S2MPU09_SPEEDY_CHANNEL	0
++#define S2MPU09_LDO2_CTRL		0x3a
++#define S2MPU09_LDO35_CTRL		0x5c
++#define S2MPU09_ENABLE_MASK	GENMASK(7, 6)
++#define S2MPU09_VSEL_MASK		GENMASK(5, 0)
++
++static int s2mpu09_read(void *context, unsigned int reg, unsigned int *val)
++{
++	struct acpm_handle *acpm = context;
++	u8 data;
++	int ret;
++
++	ret = acpm->ops->pmic.read_reg(acpm, S2MPU09_ACPM_CHANNEL,
++		S2MPU09_PMIC_BANK, reg, S2MPU09_SPEEDY_CHANNEL, &data);
++	if (!ret)
++		*val = data;
++	return ret;
++}
++
++static int s2mpu09_write(void *context, unsigned int reg, unsigned int val)
++{
++	struct acpm_handle *acpm = context;
++
++	return acpm->ops->pmic.write_reg(acpm, S2MPU09_ACPM_CHANNEL,
++		S2MPU09_PMIC_BANK, reg, S2MPU09_SPEEDY_CHANNEL, val);
++}
++
++static int s2mpu09_update(void *context, unsigned int reg,
++			  unsigned int mask, unsigned int val)
++{
++	struct acpm_handle *acpm = context;
++
++	return acpm->ops->pmic.update_reg(acpm, S2MPU09_ACPM_CHANNEL,
++		S2MPU09_PMIC_BANK, reg, S2MPU09_SPEEDY_CHANNEL, val, mask);
++}
++
++static const struct regmap_bus s2mpu09_bus = {
++	.reg_read = s2mpu09_read,
++	.reg_write = s2mpu09_write,
++	.reg_update_bits = s2mpu09_update,
++};
++
++static bool s2mpu09_accessible_reg(struct device *dev, unsigned int reg)
++{
++	return reg == S2MPU09_LDO2_CTRL || reg == S2MPU09_LDO35_CTRL;
++}
++
++static const struct regmap_config s2mpu09_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = S2MPU09_LDO35_CTRL,
++	.readable_reg = s2mpu09_accessible_reg,
++	.writeable_reg = s2mpu09_accessible_reg,
++};
++
++static const struct regulator_ops s2mpu09_ldo_ops = {
++	.list_voltage = regulator_list_voltage_linear,
++	.map_voltage = regulator_map_voltage_linear,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++};
++
++#define S2MPU09_LDO(_id, _reg) { \
++	.name = "LDO" #_id, \
++	.of_match = "ldo" #_id, \
++	.regulators_node = "regulators", \
++	.id = _id, \
++	.ops = &s2mpu09_ldo_ops, \
++	.type = REGULATOR_VOLTAGE, \
++	.owner = THIS_MODULE, \
++	.min_uV = 1800000, \
++	.uV_step = 25000, \
++	.n_voltages = 64, \
++	.vsel_reg = _reg, \
++	.vsel_mask = S2MPU09_VSEL_MASK, \
++	.enable_reg = _reg, \
++	.enable_mask = S2MPU09_ENABLE_MASK, \
++	.enable_time = 128, \
++}
++
++static const struct regulator_desc s2mpu09_regulators[] = {
++	S2MPU09_LDO(2, S2MPU09_LDO2_CTRL),
++	S2MPU09_LDO(35, S2MPU09_LDO35_CTRL),
++};
++
++static int s2mpu09_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct regulator_config config = { .dev = dev };
++	struct acpm_handle *acpm;
++	struct regulator_dev *rdev;
++	int i, ret;
++	u8 chip_id;
++
++	acpm = devm_acpm_get_by_node(dev, dev->parent->of_node);
++	if (IS_ERR(acpm))
++		return dev_err_probe(dev, PTR_ERR(acpm), "ACPM unavailable\n");
++
++	ret = acpm->ops->pmic.read_reg(acpm, S2MPU09_ACPM_CHANNEL, 0, 0,
++				     S2MPU09_SPEEDY_CHANNEL, &chip_id);
++	if (ret)
++		return dev_err_probe(dev, ret, "PMIC identification failed\n");
++
++	config.regmap = devm_regmap_init(dev, &s2mpu09_bus, acpm,
++					&s2mpu09_regmap_config);
++	if (IS_ERR(config.regmap))
++		return PTR_ERR(config.regmap);
++
++	for (i = 0; i < ARRAY_SIZE(s2mpu09_regulators); i++) {
++		rdev = devm_regulator_register(dev, &s2mpu09_regulators[i], &config);
++		if (IS_ERR(rdev))
++			return dev_err_probe(dev, PTR_ERR(rdev),
++					     "LDO registration failed\n");
++	}
++	dev_info(dev, "S2MPU09 revision %#x, SD supplies registered\n", chip_id);
++	return 0;
++}
++
++static const struct of_device_id s2mpu09_of_match[] = {
++	{ .compatible = "samsung,s2mpu09-pmic" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s2mpu09_of_match);
++
++static struct platform_driver s2mpu09_driver = {
++	.probe = s2mpu09_probe,
++	.driver = {
++		.name = "s2mpu09-acpm-regulator",
++		.of_match_table = s2mpu09_of_match,
++	},
++};
++module_platform_driver(s2mpu09_driver);
++
++MODULE_DESCRIPTION("Samsung S2MPU09 microSD supplies over ACPM");
++MODULE_LICENSE("GPL");

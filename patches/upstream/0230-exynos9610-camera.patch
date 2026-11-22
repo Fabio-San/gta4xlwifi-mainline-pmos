@@ -1,0 +1,2589 @@
+Exynos9610 gta4xl camera bring-up (S5K4HA / S5K5E9 + CSIS)
+
+Add a local raw-Bayer capture path for the SM-P615 cameras.  The sensors
+are driven over the two PERI CAMI2C buses and the CSIS receiver writes
+packed RAW10 frames directly to memory with its VC-DMA.  The downstream
+FIMC-IS/3AA/ISP firmware stack is intentionally not used.
+
+This adds the camera power domain, CMU_CAM provider, sysmmu_cam, both
+CSIS ports, the sensor nodes, fixed load-switch regulators and the
+main PMIC camera rails, plus the USI-2 reset/interrupt handling needed
+by the HSI2C controllers.  Register tables and sequences are derived
+from the LineageOS 4.14 gta4xl kernel.
+
+---
+diff --git a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -45,6 +45,43 @@
+ 					regulator-name = "vmmc";
+ 					regulator-min-microvolt = <2900000>;
+ 					regulator-max-microvolt = <2900000>;
++				};
++
++				/* Camera rails (ACPM PMIC LDOs). */
++				ldo33: ldo33 {
++					regulator-name = "camio_1v8";
++					regulator-min-microvolt = <1800000>;
++					regulator-max-microvolt = <1800000>;
++				};
++
++				ldo34: ldo34 {
++					regulator-name = "fcam_2v8";
++					regulator-min-microvolt = <2800000>;
++					regulator-max-microvolt = <2800000>;
++				};
++
++				ldo37: ldo37 {
++					regulator-name = "rcam_2v8";
++					regulator-min-microvolt = <2800000>;
++					regulator-max-microvolt = <2800000>;
++				};
++
++				ldo39: ldo39 {
++					regulator-name = "cam_1v8_aux";
++					regulator-min-microvolt = <1800000>;
++					regulator-max-microvolt = <1800000>;
++				};
++
++				ldo41: ldo41 {
++					regulator-name = "cam_3v0_aux";
++					regulator-min-microvolt = <3000000>;
++					regulator-max-microvolt = <3000000>;
++				};
++
++				ldo44: ldo44 {
++					regulator-name = "cam_core_1v2";
++					regulator-min-microvolt = <1200000>;
++					regulator-max-microvolt = <1200000>;
+ 				};
+ 			};
+ 		};
+@@ -795,3 +832,5 @@
+ 		};
+ 	};
+ };
++
++#include "exynos9610-gta4xl-camera.dtsi"
+diff --git a/drivers/i2c/busses/i2c-exynos5.c b/drivers/i2c/busses/i2c-exynos5.c
+--- a/drivers/i2c/busses/i2c-exynos5.c
++++ b/drivers/i2c/busses/i2c-exynos5.c
+@@ -59,6 +59,12 @@
+ #define HSI2C_TIMING_SLA	0x6C
+ #define HSI2C_ADDR		0x70
+ 
++/* USI-2 register block at the tail of the HS-I2C register window. */
++#define EXYNOS5_USI_CON		0xC4
++#define EXYNOS5_USI_OPTION	0xC8
++#define EXYNOS5_USI_CLKREQ_ON	BIT(1)
++#define EXYNOS5_USI_CLKSTOP_ON	BIT(2)
++
+ /* I2C_CTL Register bits */
+ #define HSI2C_FUNC_MODE_I2C			(1u << 0)
+ #define HSI2C_MASTER				(1u << 3)
+@@ -205,6 +211,9 @@
+ 
+ 	/* Version of HS-I2C Hardware */
+ 	const struct exynos_hsi2c_variant *variant;
++
++	/* The block is a USI-2 wrapper whose reset must be released. */
++	bool			usi_v2;
+ };
+ 
+ /**
+@@ -239,6 +248,12 @@
+ static const struct exynos_hsi2c_variant exynosautov9_hsi2c_data = {
+ 	.fifo_depth	= 64,
+ 	.hw		= I2C_TYPE_EXYNOSAUTOV9,
++};
++
++/* USI-2 I2C block: 64-byte FIFOs and the TRANS_DONE interrupt group. */
++static const struct exynos_hsi2c_variant exynos9610_hsi2c_data = {
++	.fifo_depth	= 64,
++	.hw		= I2C_TYPE_EXYNOS7,
+ };
+ 
+ static const struct exynos_hsi2c_variant exynos8895_hsi2c_data = {
+@@ -512,6 +527,13 @@
+ 	int_status = readl(i2c->regs + HSI2C_INT_STATUS);
+ 	writel(int_status, i2c->regs + HSI2C_INT_STATUS);
+ 
++	if (i2c->usi_v2)
++		dev_info_ratelimited(i2c->dev,
++			"irq int=%08x trans=%08x fifo=%08x ptr=%u/%u state=%d\n",
++			int_status, readl(i2c->regs + HSI2C_TRANS_STATUS),
++			readl(i2c->regs + HSI2C_FIFO_STATUS),
++			i2c->msg_ptr, i2c->msg ? i2c->msg->len : 0, i2c->state);
++
+ 	/* handle interrupt related to the transfer status */
+ 	switch (i2c->variant->hw) {
+ 	case I2C_TYPE_EXYNOSAUTOV9:
+@@ -750,6 +772,10 @@
+ 		i2c_addr |= HSI2C_MASTER_ID(MASTER_ID(i2c->adap.nr));
+ 
+ 	writel(i2c_addr, i2c->regs + HSI2C_ADDR);
++	if (i2c->usi_v2)
++		dev_info_ratelimited(i2c->dev,
++			"addr write %08x read %08x\n", i2c_addr,
++			readl(i2c->regs + HSI2C_ADDR));
+ 
+ 	writel(fifo_ctl, i2c->regs + HSI2C_FIFO_CTL);
+ 	writel(i2c_ctl, i2c->regs + HSI2C_CTL);
+@@ -884,6 +910,32 @@
+ 	.functionality = exynos5_i2c_func,
+ };
+ 
++/*
++ * The dedicated USI-2 blocks (PERI CAMI2C, SPI, ...) start in reset.  The
++ * protocol selection is left to the bootloader, but the reset line has to be
++ * released before the underlying IP can be accessed.
++ */
++static void exynos5_i2c_usi_release(struct exynos5_i2c *i2c)
++{
++	u32 val;
++
++	if (!i2c->usi_v2)
++		return;
++
++	writel(0, i2c->regs + EXYNOS5_USI_CON);
++
++	/*
++	 * The HS-I2C IP clock is auto-gated by the CMU.  The USI wrapper
++	 * has to keep its clock request asserted for the controller to be
++	 * able to complete a transfer.
++	 */
++	val = readl(i2c->regs + EXYNOS5_USI_OPTION);
++	val |= EXYNOS5_USI_CLKREQ_ON;
++	val &= ~EXYNOS5_USI_CLKSTOP_ON;
++	writel(val, i2c->regs + EXYNOS5_USI_OPTION);
++	udelay(1);
++}
++
+ static int exynos5_i2c_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
+@@ -929,6 +981,9 @@
+ 		goto err_clk;
+ 	}
+ 
++	i2c->usi_v2 = of_property_read_bool(np, "samsung,usi-i2c-v2");
++	exynos5_i2c_usi_release(i2c);
++
+ 	i2c->adap.dev.of_node = np;
+ 	i2c->adap.algo_data = i2c;
+ 	i2c->adap.dev.parent = &pdev->dev;
+@@ -951,11 +1006,20 @@
+ 	}
+ 
+ 	i2c->variant = of_device_get_match_data(&pdev->dev);
++	/*
++	 * USI-2 based instances do not generate the legacy INT_I2C bit;
++	 * they report completion through the TRANS_DONE interrupt group.
++	 */
++	if (i2c->usi_v2)
++		i2c->variant = &exynos9610_hsi2c_data;
+ 
+ 	ret = exynos5_hsi2c_clock_setup(i2c);
+ 	if (ret)
+ 		goto err_clk;
+ 
++	dev_info(&pdev->dev, "clkin %lu Hz, op %u Hz\n",
++		 clk_get_rate(i2c->clk), i2c->op_clock);
++
+ 	exynos5_i2c_reset(i2c);
+ 
+ 	ret = i2c_add_adapter(&i2c->adap);
+@@ -1015,6 +1079,7 @@
+ 	if (ret)
+ 		goto err_clk;
+ 
++	exynos5_i2c_usi_release(i2c);
+ 	exynos5_i2c_init(i2c);
+ 	clk_disable(i2c->clk);
+ 	clk_disable(i2c->pclk);
+diff --git a/drivers/media/platform/samsung/Kconfig b/drivers/media/platform/samsung/Kconfig
+--- a/drivers/media/platform/samsung/Kconfig
++++ b/drivers/media/platform/samsung/Kconfig
+@@ -8,3 +8,16 @@
+ source "drivers/media/platform/samsung/s5p-g2d/Kconfig"
+ source "drivers/media/platform/samsung/s5p-jpeg/Kconfig"
+ source "drivers/media/platform/samsung/s5p-mfc/Kconfig"
++
++config VIDEO_EXYNOS9610_CAMERA
++	tristate "Exynos9610 gta4xl S5K4HA/S5K5E9 CSIS camera"
++	depends on VIDEO_DEV
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_FWNODE
++	help
++	  Local bring-up driver for the raw Bayer cameras of the Samsung
++	  Galaxy Tab S6 Lite (SM-P615, Exynos9610).  It drives the S5K4HA
++	  and S5K5E9 sensors over I2C and captures packed RAW10 frames from
++	  the CSIS receiver through its VC-DMA.  The FIMC-IS/ISP chain is
++	  not used, so colour processing is done in userspace.
+diff --git a/drivers/media/platform/samsung/Makefile b/drivers/media/platform/samsung/Makefile
+--- a/drivers/media/platform/samsung/Makefile
++++ b/drivers/media/platform/samsung/Makefile
+@@ -5,3 +5,4 @@
+ obj-y += s5p-g2d/
+ obj-y += s5p-jpeg/
+ obj-y += s5p-mfc/
++obj-$(CONFIG_VIDEO_EXYNOS9610_CAMERA) += exynos9610-camera.o
+diff --git a/drivers/regulator/s2mpu09-acpm.c b/drivers/regulator/s2mpu09-acpm.c
+--- a/drivers/regulator/s2mpu09-acpm.c
++++ b/drivers/regulator/s2mpu09-acpm.c
+@@ -14,7 +14,13 @@
+ #define S2MPU09_PMIC_BANK		1
+ #define S2MPU09_SPEEDY_CHANNEL	0
+ #define S2MPU09_LDO2_CTRL		0x3a
++#define S2MPU09_LDO33_CTRL		0x5a
++#define S2MPU09_LDO34_CTRL		0x5b
+ #define S2MPU09_LDO35_CTRL		0x5c
++#define S2MPU09_LDO37_CTRL		0x5e
++#define S2MPU09_LDO39_CTRL		0x60
++#define S2MPU09_LDO41_CTRL		0x62
++#define S2MPU09_LDO44_CTRL		0x65
+ #define S2MPU09_ENABLE_MASK	GENMASK(7, 6)
+ #define S2MPU09_VSEL_MASK		GENMASK(5, 0)
+ 
+@@ -56,13 +62,25 @@
+ 
+ static bool s2mpu09_accessible_reg(struct device *dev, unsigned int reg)
+ {
+-	return reg == S2MPU09_LDO2_CTRL || reg == S2MPU09_LDO35_CTRL;
++	switch (reg) {
++	case S2MPU09_LDO2_CTRL:
++	case S2MPU09_LDO33_CTRL:
++	case S2MPU09_LDO34_CTRL:
++	case S2MPU09_LDO35_CTRL:
++	case S2MPU09_LDO37_CTRL:
++	case S2MPU09_LDO39_CTRL:
++	case S2MPU09_LDO41_CTRL:
++	case S2MPU09_LDO44_CTRL:
++		return true;
++	default:
++		return false;
++	}
+ }
+ 
+ static const struct regmap_config s2mpu09_regmap_config = {
+ 	.reg_bits = 8,
+ 	.val_bits = 8,
+-	.max_register = S2MPU09_LDO35_CTRL,
++	.max_register = S2MPU09_LDO44_CTRL,
+ 	.readable_reg = s2mpu09_accessible_reg,
+ 	.writeable_reg = s2mpu09_accessible_reg,
+ };
+@@ -77,7 +95,7 @@
+ 	.disable = regulator_disable_regmap,
+ };
+ 
+-#define S2MPU09_LDO(_id, _reg) { \
++#define S2MPU09_LDO(_id, _reg, _min, _step) { \
+ 	.name = "LDO" #_id, \
+ 	.of_match = "ldo" #_id, \
+ 	.regulators_node = "regulators", \
+@@ -85,8 +103,8 @@
+ 	.ops = &s2mpu09_ldo_ops, \
+ 	.type = REGULATOR_VOLTAGE, \
+ 	.owner = THIS_MODULE, \
+-	.min_uV = 1800000, \
+-	.uV_step = 25000, \
++	.min_uV = _min, \
++	.uV_step = _step, \
+ 	.n_voltages = 64, \
+ 	.vsel_reg = _reg, \
+ 	.vsel_mask = S2MPU09_VSEL_MASK, \
+@@ -96,8 +114,14 @@
+ }
+ 
+ static const struct regulator_desc s2mpu09_regulators[] = {
+-	S2MPU09_LDO(2, S2MPU09_LDO2_CTRL),
+-	S2MPU09_LDO(35, S2MPU09_LDO35_CTRL),
++	S2MPU09_LDO(2, S2MPU09_LDO2_CTRL, 1800000, 25000),
++	S2MPU09_LDO(33, S2MPU09_LDO33_CTRL, 700000, 25000),
++	S2MPU09_LDO(34, S2MPU09_LDO34_CTRL, 1800000, 25000),
++	S2MPU09_LDO(35, S2MPU09_LDO35_CTRL, 1800000, 25000),
++	S2MPU09_LDO(37, S2MPU09_LDO37_CTRL, 1800000, 25000),
++	S2MPU09_LDO(39, S2MPU09_LDO39_CTRL, 700000, 25000),
++	S2MPU09_LDO(41, S2MPU09_LDO41_CTRL, 1800000, 25000),
++	S2MPU09_LDO(44, S2MPU09_LDO44_CTRL, 700000, 12500),
+ };
+ 
+ static int s2mpu09_probe(struct platform_device *pdev)
+@@ -129,7 +153,8 @@
+ 			return dev_err_probe(dev, PTR_ERR(rdev),
+ 					     "LDO registration failed\n");
+ 	}
+-	dev_info(dev, "S2MPU09 revision %#x, SD supplies registered\n", chip_id);
++	dev_info(dev, "S2MPU09 revision %#x, SD and camera supplies registered\n",
++		 chip_id);
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-camera.dtsi b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-camera.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-camera.dtsi
+@@ -0,0 +1,249 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * SM-P615 (gta4xl) camera subsystem.
++ *
++ * The rear S5K4HA and front S5K5E9 are raw Bayer sensors behind the
++ * Exynos9610 CSIS receiver.  Only the CSIS capture path is described here:
++ * the downstream FIMC-IS/3AA/ISP chain is not used.
++ */
++
++#include <dt-bindings/clock/samsung,exynos9610-cmu.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++
++#include "exynos-pinctrl.h"
++
++/ {
++	/*
++	 * Camera rail switches.  The actual regulators are always-on PMIC
++	 * rails; these GPIOs enable the sensor-side load switches.
++	 */
++	camio_1p8: regulator-camio-1p8 {
++		compatible = "regulator-fixed";
++		regulator-name = "camio_1p8";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&gpg0 7 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&ldo33>;
++	};
++
++	rcam_2p8: regulator-rcam-2p8 {
++		compatible = "regulator-fixed";
++		regulator-name = "rcam_2p8";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&gpg0 6 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&ldo37>;
++	};
++
++	fcam_2p8: regulator-fcam-2p8 {
++		compatible = "regulator-fixed";
++		regulator-name = "fcam_2p8";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&gpg2 0 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&ldo34>;
++	};
++};
++
++&pinctrl_top {
++	cam_mclk0_fn: cam-mclk0-fn-pins {
++		samsung,pins = "gpc2-0";
++		samsung,pin-function = <2>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5420_PIN_DRV_LV2>;
++	};
++
++	cam_mclk1_fn: cam-mclk1-fn-pins {
++		samsung,pins = "gpc2-1";
++		samsung,pin-function = <2>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5420_PIN_DRV_LV2>;
++	};
++
++	cam_mclk0_idle: cam-mclk0-idle-pins {
++		samsung,pins = "gpc2-0";
++		samsung,pin-function = <0>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5420_PIN_DRV_LV2>;
++	};
++
++	cam_mclk1_idle: cam-mclk1-idle-pins {
++		samsung,pins = "gpc2-1";
++		samsung,pin-function = <0>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5420_PIN_DRV_LV2>;
++	};
++};
++
++&soc {
++	/* CAM power domain at PMU+0x4020.  The rear PHY is powered by it. */
++	pd_cam: power-domain@11864020 {
++		compatible = "samsung,exynos9610-pd";
++		reg = <0x11864020 0x20>;
++		#power-domain-cells = <0>;
++		label = "pd-cam";
++		samsung,always-on;
++	};
++
++	/* Register window shared with the CMU_CAM clock provider. */
++	cam_syscon: syscon@14500000 {
++		compatible = "syscon";
++		reg = <0x14500000 0x8000>;
++	};
++
++	cmu_cam: clock-controller@14500000 {
++		compatible = "samsung,exynos9610-cmu-cam";
++		reg = <0x14500000 0x10000>;
++		#clock-cells = <1>;
++		clocks = <&oscclk>, <&cmu_top CLK_DOUT_CMU_CAM_BUS>;
++		clock-names = "oscclk", "dout_cmu_cam_bus";
++	};
++
++	sysmmu_cam: iommu@14550000 {
++		compatible = "samsung,exynos-sysmmu";
++		reg = <0x14550000 0x9000>;
++		interrupts = <GIC_SPI 341 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 342 IRQ_TYPE_LEVEL_HIGH>;
++		clock-names = "aclk", "pclk";
++		clocks = <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_SMMU_CAM>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_SMMU_CAM>;
++		#iommu-cells = <0>;
++		power-domains = <&pd_cam>;
++	};
++
++	/*
++	 * Camera control buses.  The USI-2 HSI2C blocks are not usable for
++	 * reliable transfers on this bring-up, so the same pins are driven by
++	 * the generic open-drain i2c-gpio master.  The CSI data path does not
++	 * depend on these controllers.
++	 */
++	i2c_cam0: i2c-cam0 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpc0 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpc0 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		front_cam: camera@2d {
++			compatible = "samsung,s5k5e9";
++			reg = <0x2d>;
++			pinctrl-names = "default", "sleep";
++			pinctrl-0 = <&cam_mclk1_fn>;
++			pinctrl-1 = <&cam_mclk1_idle>;
++			clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
++			clock-names = "mclk";
++			clock-frequency = <26000000>;
++			reset-gpios = <&gpg1 7 GPIO_ACTIVE_LOW>;
++			vddio-supply = <&camio_1p8>;
++			vdda-supply = <&fcam_2p8>;
++			vddcore-supply = <&ldo44>;
++			status = "okay";
++		};
++	};
++
++	i2c_cam1: i2c-cam1 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpc0 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpc0 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		rear_cam: camera@2d {
++			compatible = "samsung,s5k4ha";
++			reg = <0x2d>;
++			pinctrl-names = "default", "sleep";
++			pinctrl-0 = <&cam_mclk0_fn>;
++			pinctrl-1 = <&cam_mclk0_idle>;
++			clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
++			clock-names = "mclk";
++			clock-frequency = <26000000>;
++			reset-gpios = <&gpg1 1 GPIO_ACTIVE_LOW>;
++			vddio-supply = <&camio_1p8>;
++			vdda-supply = <&rcam_2p8>;
++			vddcore-supply = <&ldo44>;
++			status = "okay";
++		};
++	};
++
++	/* PERI I2C_3: S2MPB03 camera PMIC (CAM_VLDO1..7). */
++	i2c_3: i2c@13860000 {
++		compatible = "samsung,s3c2440-i2c";
++		reg = <0x13860000 0x100>;
++		interrupts = <GIC_SPI 250 IRQ_TYPE_LEVEL_HIGH>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&i2c3_bus>;
++		clocks = <&cmu_peri CLK_DOUT_CLK_PERI_I2C>;
++		clock-names = "i2c";
++		clock-frequency = <100000>;
++		status = "okay";
++
++		s2mpb03: pmic@56 {
++			compatible = "samsung,s2mpb03";
++			reg = <0x56>;
++			status = "okay";
++		};
++	};
++
++	csi0: csi@14400000 {
++		compatible = "samsung,exynos9610-csis";
++		reg = <0x14400000 0x700>,	/* CSIS0 */
++		      <0x14400700 0x100>,	/* D-PHY */
++		      <0x14450000 0x500>,	/* VC DMA0 (4 channels) */
++		      <0x14490000 0x1000>;	/* shared common DMA */
++		reg-names = "csi", "phy", "vc-dma", "common-dma";
++		samsung,csi-port = <0>;
++		interrupts = <GIC_SPI 325 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 331 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "csi", "dma";
++		clocks = <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_CSIS0>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_GLUE_CSIS0>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_DMA>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_PCLK_PGEN_LITE_CAM0>,
++			 <&cmu_top CLK_DOUT_CMU_CAM_BUS>;
++		clock-names = "csis", "glue", "dma", "pclk", "bus";
++		power-domains = <&pd_cam>;
++		iommus = <&sysmmu_cam>;
++		dma-noncoherent;
++		samsung,pmu-syscon = <&pmu>;
++		samsung,cmu-syscon = <&cam_syscon>;
++		/* PMU isolation bypass bit for this D-PHY. */
++		samsung,phy-isolation = <0x70c>;
++		sensor = <&rear_cam>;
++		status = "okay";
++	};
++
++	csi1: csi@14410000 {
++		compatible = "samsung,exynos9610-csis";
++		reg = <0x14410000 0x700>,	/* CSIS1 */
++		      <0x14410700 0x100>,	/* D-PHY */
++		      <0x14460000 0x500>,	/* VC DMA1 */
++		      <0x14490000 0x1000>;	/* shared common DMA */
++		reg-names = "csi", "phy", "vc-dma", "common-dma";
++		samsung,csi-port = <1>;
++		interrupts = <GIC_SPI 326 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 332 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "csi", "dma";
++		clocks = <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_CSIS1>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_GLUE_CSIS1>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_ACLK_DMA>,
++			 <&cmu_cam CLK_GOUT_CAM_IS6P10P0_PCLK_PGEN_LITE_CAM1>,
++			 <&cmu_top CLK_DOUT_CMU_CAM_BUS>;
++		clock-names = "csis", "glue", "dma", "pclk", "bus";
++		power-domains = <&pd_cam>;
++		iommus = <&sysmmu_cam>;
++		dma-noncoherent;
++		samsung,pmu-syscon = <&pmu>;
++		samsung,cmu-syscon = <&cam_syscon>;
++		samsung,phy-isolation = <0x710>;
++		sensor = <&front_cam>;
++		status = "okay";
++	};
++};
+diff --git a/drivers/media/platform/samsung/exynos9610-camera.c b/drivers/media/platform/samsung/exynos9610-camera.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/platform/samsung/exynos9610-camera.c
+@@ -0,0 +1,1681 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos9610 (gta4xl) camera capture
++ *
++ * This is a local bring-up driver for the two raw Bayer cameras of the
++ * Samsung Galaxy Tab S6 Lite (SM-P615): S5K4HA on CSIS0 and S5K5E9 on
++ * CSIS1.  It programs the sensor over I2C and captures the raw CSI-2
++ * stream through the CSIS VC-DMA into memory.
++ *
++ * The downstream Samsung stack routes the same sensors through FIMC-IS,
++ * the 3AA and the ISP firmware.  That pipeline is deliberately not used
++ * here: the sensors are put into a known mode with the vendor register
++ * tables and the CSIS writes the raw frames directly to memory.  Colour
++ * processing is left to userspace.
++ *
++ * Register layouts and sequences are derived from the LineageOS 4.14
++ * drivers/media/platform/exynos/fimc-is2 driver for this exact board.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/videodev2.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-ctrls.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "exynos9610-camera-tables.h"
++
++#define CAM_DRV_NAME		"exynos9610-camera"
++#define CAM_MAGIC		0x9610ca3e
++#define CAM_NUM_SLOTS		8
++#define CAM_MAX_BUFFERS		CAM_NUM_SLOTS
++#define CAM_DEFAULT_MCLK	26000000
++
++/* ------------------------------------------------------------------ */
++/* CSIS register offsets (v5.1, used by Exynos9610 "Ramen")           */
++/* ------------------------------------------------------------------ */
++
++/* CSIS core, relative to the per-port "csi" mapping */
++#define CSIS_CMN_CTRL		0x0004
++#define CSIS_CMN_CSI_EN		BIT(0)
++#define CSIS_CMN_SW_RESET	BIT(1)
++#define CSIS_CMN_LANE_SHIFT	8
++#define CSIS_CMN_LANE_MASK	GENMASK(9, 8)
++#define CSIS_CMN_INTERLEAVE_MASK GENMASK(11, 10)
++#define CSIS_CMN_UPDATE_SHADOW	GENMASK(19, 16)
++#define CSIS_CMN_QCHANNEL_EN	BIT(20)
++#define CSIS_CMN_PHY_SEL	BIT(21)
++
++#define CSIS_INT_MSK0		0x0010
++#define CSIS_INT_SRC0		0x0014
++#define CSIS_INT_MSK1		0x0018
++#define CSIS_INT_SRC1		0x001c
++
++#define CSIS_ISP_CONFIG(vc)	(0x0040 + 0x10 * (vc))
++#define CSIS_ISP_CFG_PIXEL_MODE	GENMASK(13, 12)
++#define CSIS_ISP_CFG_DATAFORMAT	GENMASK(7, 2)
++#define CSIS_ISP_CFG_VC		GENMASK(1, 0)
++#define CSIS_ISP_RESOL(vc)	(0x0044 + 0x10 * (vc))
++#define CSIS_ISP_SYNC(vc)	(0x0048 + 0x10 * (vc))
++#define CSIS_ISP_SYNC_HSYNC_LINTV GENMASK(23, 18)
++#define CSIS_FRM_CNT(vc)	(0x0100 + 0x4 * (vc))
++#define CSIS_LINE_INTR(vc)	(0x0110 + 0x4 * (vc))
++
++#define CSIS_PHY_CMN_CTRL	0x0704	/* in CSIS block */
++#define CSIS_PHY_EN_CLK		BIT(0)
++#define CSIS_PHY_EN_DAT		GENMASK(4, 1)
++
++#define CSIS_INT_MASK0_DEFAULT	0x011fff1f
++#define CSIS_INT_MASK1_DEFAULT	0x0000fff0
++#define CSIS_DMA_INT_MASK_DEFAULT 0x00f11ff0
++
++/* VC DMA channel, relative to "vc-dma" + 0x100 * vc */
++#define VCDMA_CTRL		0x0000
++#define VCDMA_CTRL_ENABLE	BIT(0)
++#define VCDMA_CTRL_UPDT_PTR_EN	BIT(1)
++#define VCDMA_CTRL_UPDT_FRAMEPTR GENMASK(4, 2)
++#define VCDMA_FMT		0x0004
++#define VCDMA_FMT_DIM		BIT(5)	/* 0 = 2D, 1 = 1D */
++#define VCDMA_FMT_STORAGE	BIT(4)
++#define VCDMA_FMT_PACK12	BIT(3)
++#define VCDMA_FMT_BYTESWAP	BIT(2)
++#define VCDMA_FMT_DATAFORMAT	GENMASK(1, 0)
++#define VCDMA_ADDR(n)		(0x0010 + 0x4 * ((n) - 1))
++#define VCDMA_ACT_CTRL		0x0030
++#define VCDMA_ACT_FRAMEPTR	GENMASK(4, 2)
++#define VCDMA_ACT_ENABLE	BIT(0)
++#define VCDMA_RESOL		0x0040
++#define VCDMA_RESOL_WIDTH	GENMASK(13, 0)
++
++/* VC DMA common block, relative to "vc-dma" + 0x400 */
++#define VCDMA_CMN_DATA_CTRL	0x0400
++#define VCDMA_CMN_INPUT_PATH(vc) BIT(vc)
++#define VCDMA_CMN_INT_MASK	0x0404
++#define VCDMA_CMN_INT_SRC	0x0408
++#define VCDMA_CMN_INT_OTF_OVERLAP GENMASK(23, 20)
++#define VCDMA_CMN_INT_ERROR	BIT(12)
++#define VCDMA_CMN_INT_FRM_END(vc) BIT(8 + (vc))
++#define VCDMA_CMN_INT_FRM_START(vc) BIT(4 + (vc))
++#define VCDMA_CMN_INT_LINE_END(vc) BIT(0 + (vc))
++#define VCDMA_CMN_OTF_FORMAT	0x041c
++
++/* Shared common DMA, "common-dma" mapping */
++#define CDMA_ARB_PRI		0x0000
++#define CDMA_AXI_ARB_PRI	0x0004
++#define CDMA_CTRL		0x0008
++#define CDMA_CTRL_SW_RESET	BIT(0)
++#define CDMA_CTRL_IP_PROCESSING	BIT(1)
++#define CDMA_CTRL_QCHANNEL_EN	BIT(2)
++#define CDMA_SRAM_SPLIT		0x000c
++#define CDMA_SRAM_SPLIT_MASK	GENMASK(9, 0)
++#define CDMA_MATRIX		0x0010
++#define CDMA_MATRIX_MASK	GENMASK(4, 0)
++#define CDMA_CLK_CTRL		0x0014
++#define CDMA_TEST_ENABLE	0x0020
++#define CDMA_TEST_ENABLE_TP	BIT(31)
++#define CDMA_TEST_ENABLE_PPC	BIT(30)
++#define CDMA_TEST_ENABLE_VBLANK	GENMASK(29, 0)
++#define CDMA_TEST_CTRL		0x0024
++#define CDMA_TEST_RESOL		0x0028
++#define CDMA_TEST_VSIZE		GENMASK(29, 16)
++#define CDMA_TEST_HSIZE		GENMASK(13, 0)
++
++/* D-PHY block, relative to "phy" mapping */
++#define PHY_CMN_CTRL		0x0004
++#define PHY_HSSETTLE		GENMASK(31, 24)
++#define PHY_S_CLKSETTLECTL	GENMASK(23, 16)
++#define PHY_S_BYTE_CLK_ENABLE	BIT(7)
++#define PHY_BCTRL(n)		(0x0008 + 0x4 * (n))	/* 0..3 */
++#define PHY_SCTRL(n)		(0x0018 + 0x4 * (n))	/* 0..3 */
++#define PHY_SCTRL_HI(n)		(0x0048 + 0x4 * ((n) - 4)) /* 4..6 */
++
++#define MIPI_DT_RAW10		0x2b
++
++/* ------------------------------------------------------------------ */
++/* Sensor description                                                 */
++/* ------------------------------------------------------------------ */
++
++struct cam_mode {
++	const char *name;
++	u16 width;
++	u16 height;
++	u8 lanes;
++	u16 mipi_mbps;
++	const struct cam_reg *global;
++	size_t nglobal;
++	const struct cam_reg *regs;
++	size_t nregs;
++};
++
++struct cam_sensor_cfg {
++	const char *name;
++	bool arm_start;
++	const struct cam_mode *modes;
++	unsigned int nmodes;
++};
++
++static const struct cam_mode s5k4ha_modes[] = {
++	{
++		.name = "1632x1224",
++		.width = 1632, .height = 1224,
++		.lanes = 4, .mipi_mbps = 671,
++		.global = cam_4ha_global, .nglobal = ARRAY_SIZE(cam_4ha_global),
++		.regs = cam_4ha_1632x1224_30fps,
++		.nregs = ARRAY_SIZE(cam_4ha_1632x1224_30fps),
++	},
++	{
++		.name = "3264x2448",
++		.width = 3264, .height = 2448,
++		.lanes = 4, .mipi_mbps = 671,
++		.global = cam_4ha_global, .nglobal = ARRAY_SIZE(cam_4ha_global),
++		.regs = cam_4ha_3264x2448_30fps,
++		.nregs = ARRAY_SIZE(cam_4ha_3264x2448_30fps),
++	},
++};
++
++static const struct cam_mode s5k5e9_modes[] = {
++	{
++		.name = "1280x720",
++		.width = 1280, .height = 720,
++		.lanes = 2, .mipi_mbps = 945,
++		.global = cam_5e9_global, .nglobal = ARRAY_SIZE(cam_5e9_global),
++		.regs = cam_5e9_1280x720_30fps,
++		.nregs = ARRAY_SIZE(cam_5e9_1280x720_30fps),
++	},
++	{
++		.name = "2576x1932",
++		.width = 2576, .height = 1932,
++		.lanes = 2, .mipi_mbps = 945,
++		.global = cam_5e9_global, .nglobal = ARRAY_SIZE(cam_5e9_global),
++		.regs = cam_5e9_2576x1932_30fps,
++		.nregs = ARRAY_SIZE(cam_5e9_2576x1932_30fps),
++	},
++};
++
++static const struct cam_sensor_cfg cam_sensor_cfgs[] = {
++	{
++		.name = "S5K4HA",
++		.arm_start = true,
++		.modes = s5k4ha_modes,
++		.nmodes = ARRAY_SIZE(s5k4ha_modes),
++	},
++	{
++		.name = "S5K5E9",
++		.arm_start = false,
++		.modes = s5k5e9_modes,
++		.nmodes = ARRAY_SIZE(s5k5e9_modes),
++	},
++};
++
++struct cam_sensor {
++	u32 magic;
++	struct i2c_client *client;
++	const struct cam_sensor_cfg *cfg;
++	struct clk *mclk;
++	u32 mclk_rate;
++	struct gpio_desc *reset;
++	struct regulator *vddio;
++	struct regulator *vdda;
++	struct regulator *vddcore;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_default;
++	struct pinctrl_state *pins_sleep;
++	struct mutex lock;
++	bool powered;
++	bool present;
++	unsigned int mode;
++	u16 chip_id;
++	u8 rev;
++};
++
++/* ------------------------------------------------------------------ */
++/* Sensor I2C and power                                               */
++/* ------------------------------------------------------------------ */
++
++static int cam_i2c_write(struct cam_sensor *sensor, u16 addr, u32 val, u8 width)
++{
++	u8 buf[4];
++	struct i2c_msg msg;
++	int ret;
++
++	buf[0] = addr >> 8;
++	buf[1] = addr & 0xff;
++	if (width == 2) {
++		buf[2] = (val >> 8) & 0xff;
++		buf[3] = val & 0xff;
++	} else {
++		buf[2] = val & 0xff;
++	}
++
++	msg.addr = sensor->client->addr;
++	msg.flags = 0;
++	msg.len = 2 + width;
++	msg.buf = buf;
++
++	ret = i2c_transfer(sensor->client->adapter, &msg, 1);
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++static int cam_i2c_read(struct cam_sensor *sensor, u16 addr, u32 *val, u8 width)
++{
++	u8 abuf[2] = { addr >> 8, addr & 0xff };
++	u8 rbuf[2] = { 0, 0 };
++	struct i2c_msg msg[2];
++	int ret;
++
++	msg[0].addr = sensor->client->addr;
++	msg[0].flags = 0;
++	msg[0].len = 2;
++	msg[0].buf = abuf;
++	msg[1].addr = sensor->client->addr;
++	msg[1].flags = I2C_M_RD;
++	msg[1].len = width;
++	msg[1].buf = rbuf;
++
++	ret = i2c_transfer(sensor->client->adapter, msg, 2);
++	if (ret != 2)
++		return ret < 0 ? ret : -EIO;
++
++	*val = width == 2 ? ((u32)rbuf[0] << 8) | rbuf[1] : rbuf[0];
++	return 0;
++}
++
++static int cam_sensor_power_on(struct cam_sensor *sensor)
++{
++	int ret;
++
++	if (sensor->powered)
++		return 0;
++
++	if (sensor->pinctrl && sensor->pins_default) {
++		ret = pinctrl_select_state(sensor->pinctrl, sensor->pins_default);
++		if (ret)
++			dev_warn(&sensor->client->dev,
++				 "failed to select default pin state: %d\n", ret);
++	}
++
++	/* reset-gpios is active low: logical 1 asserts the sensor reset. */
++	gpiod_set_value_cansleep(sensor->reset, 1);
++
++	if (sensor->vddcore) {
++		ret = regulator_enable(sensor->vddcore);
++		if (ret)
++			return ret;
++		usleep_range(500, 700);
++	}
++	if (sensor->vdda) {
++		ret = regulator_enable(sensor->vdda);
++		if (ret)
++			goto err_core;
++		usleep_range(500, 700);
++	}
++	if (sensor->vddio) {
++		ret = regulator_enable(sensor->vddio);
++		if (ret)
++			goto err_avdd;
++		usleep_range(2000, 2500);
++	}
++
++	if (sensor->mclk) {
++		ret = clk_set_rate(sensor->mclk, sensor->mclk_rate);
++		if (ret)
++			dev_warn(&sensor->client->dev,
++				 "failed to set MCLK rate: %d\n", ret);
++		ret = clk_prepare_enable(sensor->mclk);
++		if (ret)
++			goto err_io;
++		usleep_range(1000, 1500);
++	}
++
++	gpiod_set_value_cansleep(sensor->reset, 0);
++	usleep_range(5000, 6000);
++
++	sensor->powered = true;
++	dev_info(&sensor->client->dev, "%s powered on (MCLK %lu Hz)\n",
++		 sensor->cfg->name,
++		 sensor->mclk ? clk_get_rate(sensor->mclk) : 0);
++	return 0;
++
++err_io:
++	if (sensor->vddio)
++		regulator_disable(sensor->vddio);
++err_avdd:
++	if (sensor->vdda)
++		regulator_disable(sensor->vdda);
++err_core:
++	if (sensor->vddcore)
++		regulator_disable(sensor->vddcore);
++	return ret;
++}
++
++static void cam_sensor_power_off(struct cam_sensor *sensor)
++{
++	if (!sensor->powered)
++		return;
++
++	gpiod_set_value_cansleep(sensor->reset, 1);
++	if (sensor->mclk)
++		clk_disable_unprepare(sensor->mclk);
++	if (sensor->vddio)
++		regulator_disable(sensor->vddio);
++	if (sensor->vdda)
++		regulator_disable(sensor->vdda);
++	if (sensor->vddcore)
++		regulator_disable(sensor->vddcore);
++
++	if (sensor->pinctrl && sensor->pins_sleep)
++		pinctrl_select_state(sensor->pinctrl, sensor->pins_sleep);
++
++	sensor->powered = false;
++}
++
++static int cam_sensor_apply_table(struct cam_sensor *sensor,
++				  const struct cam_reg *regs, size_t n)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < n; i++) {
++		ret = cam_i2c_write(sensor, regs[i].addr, regs[i].val,
++				    regs[i].width);
++		if (ret) {
++			dev_err(&sensor->client->dev,
++				"write 0x%04x=0x%04x failed: %d\n",
++				regs[i].addr, regs[i].val, ret);
++			return ret;
++		}
++	}
++	return 0;
++}
++
++static int cam_sensor_set_mode(struct cam_sensor *sensor, unsigned int mode)
++{
++	const struct cam_mode *m;
++	int ret;
++
++	if (mode >= sensor->cfg->nmodes)
++		return -EINVAL;
++	m = &sensor->cfg->modes[mode];
++
++	/* The S5K4HA needs its embedded ARM firmware started before any
++	 * setfile write.  The vendor sequence does this on every boot of the
++	 * sensor, so it is repeated after each power cycle.
++	 */
++	if (sensor->cfg->arm_start) {
++		ret = cam_i2c_write(sensor, 0xfcfc, 0x4000, 2);
++		if (ret)
++			return ret;
++		ret = cam_i2c_write(sensor, 0x6010, 0x0001, 2);
++		if (ret)
++			return ret;
++		usleep_range(3000, 3500);
++	}
++
++	ret = cam_sensor_apply_table(sensor, m->global, m->nglobal);
++	if (ret)
++		return ret;
++
++	ret = cam_sensor_apply_table(sensor, m->regs, m->nregs);
++	if (ret)
++		return ret;
++
++	/* Let the internal PLL and analog blocks settle before streaming. */
++	usleep_range(1000, 1500);
++
++	sensor->mode = mode;
++	return 0;
++}
++
++static int cam_sensor_stream_on(struct cam_sensor *sensor)
++{
++	int ret;
++
++	ret = cam_sensor_set_mode(sensor, sensor->mode);
++	if (ret)
++		return ret;
++
++	/* Group parameter hold off, then start streaming. */
++	ret = cam_i2c_write(sensor, 0x0104, 0x00, 1);
++	if (ret)
++		return ret;
++	return cam_i2c_write(sensor, 0x0100, 0x01, 1);
++}
++
++static int cam_sensor_stream_off(struct cam_sensor *sensor)
++{
++	return cam_i2c_write(sensor, 0x0100, 0x00, 1);
++}
++
++static int cam_sensor_i2c_probe(struct i2c_client *client)
++{
++	struct cam_sensor *sensor;
++	const struct cam_sensor_cfg *cfg;
++	u32 val;
++	int ret;
++
++	cfg = device_get_match_data(&client->dev);
++	if (!cfg)
++		return -ENODEV;
++
++	sensor = devm_kzalloc(&client->dev, sizeof(*sensor), GFP_KERNEL);
++	if (!sensor)
++		return -ENOMEM;
++
++	sensor->magic = CAM_MAGIC;
++	sensor->client = client;
++	sensor->cfg = cfg;
++	mutex_init(&sensor->lock);
++
++	sensor->reset = devm_gpiod_get_optional(&client->dev, "reset",
++						GPIOD_OUT_HIGH);
++	if (IS_ERR(sensor->reset))
++		return dev_err_probe(&client->dev, PTR_ERR(sensor->reset),
++				     "failed to get reset GPIO\n");
++
++	sensor->vddio = devm_regulator_get_optional(&client->dev, "vddio");
++	if (IS_ERR(sensor->vddio))
++		return dev_err_probe(&client->dev, PTR_ERR(sensor->vddio),
++				     "failed to get vddio supply\n");
++	sensor->vdda = devm_regulator_get_optional(&client->dev, "vdda");
++	if (IS_ERR(sensor->vdda))
++		return dev_err_probe(&client->dev, PTR_ERR(sensor->vdda),
++				     "failed to get vdda supply\n");
++	sensor->vddcore = devm_regulator_get_optional(&client->dev, "vddcore");
++	if (IS_ERR(sensor->vddcore))
++		return dev_err_probe(&client->dev, PTR_ERR(sensor->vddcore),
++				     "failed to get vddcore supply\n");
++
++	sensor->mclk = devm_clk_get_optional(&client->dev, "mclk");
++	if (IS_ERR(sensor->mclk))
++		return dev_err_probe(&client->dev, PTR_ERR(sensor->mclk),
++				     "failed to get MCLK\n");
++	sensor->mclk_rate = CAM_DEFAULT_MCLK;
++	if (!device_property_read_u32(&client->dev, "clock-frequency", &val) &&
++	    val)
++		sensor->mclk_rate = val;
++
++	sensor->pinctrl = devm_pinctrl_get(&client->dev);
++	if (IS_ERR(sensor->pinctrl))
++		sensor->pinctrl = NULL;
++	if (sensor->pinctrl) {
++		sensor->pins_default = pinctrl_lookup_state(sensor->pinctrl,
++							    PINCTRL_STATE_DEFAULT);
++		if (IS_ERR(sensor->pins_default))
++			sensor->pins_default = NULL;
++		sensor->pins_sleep = pinctrl_lookup_state(sensor->pinctrl,
++							  "sleep");
++		if (IS_ERR(sensor->pins_sleep))
++			sensor->pins_sleep = NULL;
++	}
++
++	ret = cam_sensor_power_on(sensor);
++	if (ret)
++		return ret;
++
++	ret = cam_i2c_read(sensor, 0x0000, &val, 2);
++	if (ret) {
++		dev_err(&client->dev,
++			"no response at 0x%02x (%d); capture stays unavailable\n",
++			client->addr, ret);
++	} else {
++		sensor->present = true;
++		sensor->chip_id = val;
++		ret = cam_i2c_read(sensor, 0x0002, &val, 1);
++		sensor->rev = ret ? 0xff : val;
++		dev_info(&client->dev, "%s id 0x%04x rev 0x%02x\n",
++			 cfg->name, sensor->chip_id, sensor->rev);
++		if (sensor->cfg->arm_start)
++			cam_i2c_write(sensor, 0x0100, 0x00, 1);
++	}
++
++	i2c_set_clientdata(client, sensor);
++	return 0;
++}
++
++static void cam_sensor_i2c_remove(struct i2c_client *client)
++{
++	struct cam_sensor *sensor = i2c_get_clientdata(client);
++
++	if (!sensor)
++		return;
++	mutex_lock(&sensor->lock);
++	cam_sensor_stream_off(sensor);
++	cam_sensor_power_off(sensor);
++	mutex_unlock(&sensor->lock);
++}
++
++static const struct of_device_id cam_sensor_of_match[] = {
++	{ .compatible = "samsung,s5k4ha", .data = &cam_sensor_cfgs[0] },
++	{ .compatible = "samsung,s5k5e9", .data = &cam_sensor_cfgs[1] },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, cam_sensor_of_match);
++
++static const struct i2c_device_id cam_sensor_i2c_ids[] = {
++	{ "s5k4ha", (kernel_ulong_t)&cam_sensor_cfgs[0] },
++	{ "s5k5e9", (kernel_ulong_t)&cam_sensor_cfgs[1] },
++	{ }
++};
++
++static struct i2c_driver cam_sensor_i2c_driver = {
++	.driver = {
++		.name = "exynos9610-camera-sensor",
++		.of_match_table = cam_sensor_of_match,
++	},
++	.probe = cam_sensor_i2c_probe,
++	.remove = cam_sensor_i2c_remove,
++	.id_table = cam_sensor_i2c_ids,
++};
++
++/* ------------------------------------------------------------------ */
++/* CSIS capture driver                                                */
++/* ------------------------------------------------------------------ */
++
++static bool csi_disabled;
++module_param(csi_disabled, bool, 0444);
++MODULE_PARM_DESC(csi_disabled, "Only probe the sensor I2C drivers (bring-up aid)");
++
++static bool test_pattern;
++module_param(test_pattern, bool, 0644);
++MODULE_PARM_DESC(test_pattern, "Feed the DMA from the CSIS pattern generator");
++
++struct cam_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++};
++
++struct cam_slot {
++	struct vb2_v4l2_buffer *vb;
++	dma_addr_t addr;
++};
++
++struct cam_csi {
++	struct device *dev;
++	void __iomem *csi;
++	void __iomem *phy;
++	void __iomem *vcdma;
++	void __iomem *cdma;
++	int irq_csi;
++	int irq_dma;
++	struct clk *clk_csis;
++	struct clk *clk_glue;
++	struct clk *clk_dma;
++	struct clk *clk_pclk;
++	struct clk *clk_bus;
++	struct regmap *pmu;
++	struct regmap *cmu;
++	u32 iso_offset;
++	unsigned int port;
++
++	struct cam_sensor *sensor;
++	unsigned int mode;
++	u32 lanes;
++
++	struct v4l2_device v4l2_dev;
++	struct v4l2_ctrl_handler ctrl_handler;
++
++	struct video_device vdev;
++	struct vb2_queue queue;
++	struct mutex lock;	/* serializes stream start/stop and controls */
++	spinlock_t slock;	/* protects the DMA slot ring from the IRQ */
++
++	struct cam_slot slots[CAM_NUM_SLOTS];
++	unsigned int next_slot;
++	bool streaming;
++
++	void *scratch;
++	dma_addr_t scratch_addr;
++	size_t scratch_size;
++
++	unsigned int sequence;
++	unsigned int debug_frames;
++	unsigned long error_count;
++	unsigned long last_error_jiffies;
++
++	u32 width;
++	u32 height;
++};
++
++static unsigned int cam_fmt_sizeimage(u32 width, u32 height)
++{
++	/* Raw10 packed plus margin for line alignment. */
++	return ALIGN(width, 16) * height * 2;
++}
++
++static unsigned int cam_fmt_bytesperline(u32 width)
++{
++	return ALIGN(DIV_ROUND_UP(width * 10, 8), 16);
++}
++
++static void cam_write(struct cam_csi *csi, void __iomem *base, u32 reg, u32 val)
++{
++	writel(val, base + reg);
++}
++
++static u32 cam_read(struct cam_csi *csi, void __iomem *base, u32 reg)
++{
++	return readl(base + reg);
++}
++
++static void cam_csi_update(struct cam_csi *csi, u32 reg, u32 mask, u32 val)
++{
++	u32 v = cam_read(csi, csi->csi, reg);
++
++	v &= ~mask;
++	v |= val & mask;
++	cam_write(csi, csi->csi, reg, v);
++}
++
++/* ------------------------------------------------------------------ */
++/* CSIS programming                                                   */
++/* ------------------------------------------------------------------ */
++
++static int cam_csis_phy_defaults(struct cam_csi *csi)
++{
++	/* Exynos9610 (Ramen) D-PHY defaults, from the vendor driver. */
++	cam_write(csi, csi->phy, PHY_BCTRL(0), 0x1f4);
++	cam_write(csi, csi->phy, PHY_BCTRL(1), 0x800);
++	cam_write(csi, csi->phy, PHY_BCTRL(2), 0x10001249);
++	cam_write(csi, csi->phy, PHY_BCTRL(3), 0x500002);
++
++	cam_write(csi, csi->phy, PHY_SCTRL(0), 0x9e003e00);
++	cam_write(csi, csi->phy, PHY_SCTRL(1), 0x46);
++	cam_write(csi, csi->phy, PHY_SCTRL(2), 0x2c);
++	cam_write(csi, csi->phy, PHY_SCTRL(3), 0x200);
++	cam_write(csi, csi->phy, PHY_SCTRL_HI(4), 0x3fea);
++	cam_write(csi, csi->phy, PHY_SCTRL_HI(5), 0xc0000);
++	cam_write(csi, csi->phy, PHY_SCTRL_HI(6), 0x140);
++
++	return 0;
++}
++
++static void cam_csis_phy_settle(struct cam_csi *csi, u32 mipi_mbps)
++{
++	u32 settle = DIV_ROUND_CLOSEST(mipi_mbps, 45);
++	u32 val;
++
++	settle = clamp(settle, 1U, 46U);
++	val = cam_read(csi, csi->phy, PHY_CMN_CTRL);
++	val &= ~(PHY_HSSETTLE | PHY_S_CLKSETTLECTL);
++	val |= settle << 24;
++	val |= 1 << 16;		/* S_CLKSETTLECTL */
++	cam_write(csi, csi->phy, PHY_CMN_CTRL, val);
++}
++
++static void cam_csis_phy_power(struct cam_csi *csi, bool on)
++{
++	if (csi->pmu && csi->iso_offset)
++		regmap_update_bits(csi->pmu, csi->iso_offset, BIT(0),
++				   on ? BIT(0) : 0);
++}
++
++static void cam_csis_common_dma_init(struct cam_csi *csi)
++{
++	u32 val;
++	u32 sram0, sram1, matrix, pri0, pri1;
++
++	/* One 10 KiB CSIS SRAM pair; same split as the vendor sequence. */
++	if (csi->port == 0) {
++		pri0 = 1;
++		pri1 = 1;
++		matrix = 0;
++		sram0 = 640;
++		sram1 = 640;
++	} else {
++		pri0 = 2;
++		pri1 = 1;
++		matrix = 2;
++		sram0 = 320;
++		sram1 = 640;
++	}
++
++	val = cam_read(csi, csi->cdma, CDMA_CTRL);
++	val |= CDMA_CTRL_IP_PROCESSING;
++	cam_write(csi, csi->cdma, CDMA_CTRL, val);
++
++	val = cam_read(csi, csi->cdma, CDMA_SRAM_SPLIT);
++	val &= ~(CDMA_SRAM_SPLIT_MASK | (CDMA_SRAM_SPLIT_MASK << 16));
++	val |= sram0 | (sram1 << 16);
++	cam_write(csi, csi->cdma, CDMA_SRAM_SPLIT, val);
++
++	val = cam_read(csi, csi->cdma, CDMA_ARB_PRI);
++	val &= ~GENMASK(3, 0);
++	val |= pri0 | (pri1 << 2);
++	cam_write(csi, csi->cdma, CDMA_ARB_PRI, val);
++
++	val = cam_read(csi, csi->cdma, CDMA_MATRIX);
++	val &= ~CDMA_MATRIX_MASK;
++	val |= matrix;
++	cam_write(csi, csi->cdma, CDMA_MATRIX, val);
++}
++
++static int cam_csis_config(struct cam_csi *csi, u32 width, u32 height,
++			   u32 lanes, u32 mipi_mbps)
++{
++	csi->lanes = lanes;
++	u32 val;
++
++	/* Reset the receiver. */
++	cam_write(csi, csi->csi, CSIS_CMN_CTRL,
++		  cam_read(csi, csi->csi, CSIS_CMN_CTRL) | CSIS_CMN_SW_RESET);
++	udelay(20);
++	val = cam_read(csi, csi->csi, CSIS_CMN_CTRL) & ~CSIS_CMN_SW_RESET;
++	cam_write(csi, csi->csi, CSIS_CMN_CTRL, val);
++
++	/* Lanes, no interleave, single PHY. */
++	val = cam_read(csi, csi->csi, CSIS_CMN_CTRL);
++	val &= ~(CSIS_CMN_LANE_MASK | CSIS_CMN_INTERLEAVE_MASK |
++		 CSIS_CMN_PHY_SEL);
++	val |= (lanes - 1) << CSIS_CMN_LANE_SHIFT;
++	cam_write(csi, csi->csi, CSIS_CMN_CTRL, val);
++
++	/* VC0 carries RAW10. */
++	val = (MIPI_DT_RAW10 << 2) | (1 << 12);	/* dual pixel mode */
++	cam_write(csi, csi->csi, CSIS_ISP_CONFIG(0), val);
++	cam_write(csi, csi->csi, CSIS_ISP_RESOL(0),
++		  (height << 16) | width);
++	cam_write(csi, csi->csi, CSIS_ISP_SYNC(0), 0);
++
++	/* Interrupt masks: frame boundaries and errors. */
++	cam_write(csi, csi->csi, CSIS_INT_MSK0, CSIS_INT_MASK0_DEFAULT);
++	cam_write(csi, csi->csi, CSIS_INT_MSK1, CSIS_INT_MASK1_DEFAULT);
++
++	/* VC DMA: 2D, packed RAW10. */
++	val = cam_read(csi, csi->vcdma, VCDMA_FMT);
++	val &= ~(VCDMA_FMT_DIM | VCDMA_FMT_STORAGE | VCDMA_FMT_PACK12 |
++		 VCDMA_FMT_DATAFORMAT);
++	val |= VCDMA_FMT_PACK12;
++	cam_write(csi, csi->vcdma, VCDMA_FMT, val);
++	cam_write(csi, csi->vcdma, VCDMA_RESOL, width);
++
++	/* OTF input, RAW10 output format. */
++	cam_write(csi, csi->vcdma, VCDMA_CMN_OTF_FORMAT, 0);
++	cam_write(csi, csi->vcdma, VCDMA_CMN_DATA_CTRL, 0);
++	cam_write(csi, csi->vcdma, VCDMA_CMN_INT_MASK,
++		  CSIS_DMA_INT_MASK_DEFAULT);
++
++	cam_csis_phy_defaults(csi);
++	cam_csis_phy_settle(csi, mipi_mbps);
++	cam_csis_common_dma_init(csi);
++	return 0;
++}
++
++static void cam_csis_start_dma(struct cam_csi *csi)
++{
++	u32 val;
++
++	/* Point at slot 0 and let the hardware walk the ring. */
++	val = cam_read(csi, csi->vcdma, VCDMA_CTRL);
++	val &= ~(VCDMA_CTRL_ENABLE | VCDMA_CTRL_UPDT_PTR_EN |
++		 VCDMA_CTRL_UPDT_FRAMEPTR);
++	val |= VCDMA_CTRL_UPDT_PTR_EN;
++	cam_write(csi, csi->vcdma, VCDMA_CTRL, val);
++
++	val = cam_read(csi, csi->vcdma, VCDMA_CTRL);
++	val = (val & ~VCDMA_CTRL_UPDT_FRAMEPTR) |
++	      (0 << 2) | VCDMA_CTRL_ENABLE;
++	cam_write(csi, csi->vcdma, VCDMA_CTRL, val);
++	csi->next_slot = 0;
++}
++
++static void cam_csis_stop_dma(struct cam_csi *csi)
++{
++	u32 val = cam_read(csi, csi->vcdma, VCDMA_CTRL);
++
++	val &= ~VCDMA_CTRL_ENABLE;
++	cam_write(csi, csi->vcdma, VCDMA_CTRL, val);
++}
++
++static void cam_csis_enable(struct cam_csi *csi, bool on)
++{
++	if (!on) {
++		cam_csi_update(csi, CSIS_PHY_CMN_CTRL,
++			       CSIS_PHY_EN_CLK | CSIS_PHY_EN_DAT, 0);
++		cam_csi_update(csi, CSIS_CMN_CTRL, CSIS_CMN_CSI_EN, 0);
++		return;
++	}
++
++	/* Apply all shadowed configuration. */
++	cam_csi_update(csi, CSIS_CMN_CTRL, CSIS_CMN_UPDATE_SHADOW,
++		       CSIS_CMN_UPDATE_SHADOW);
++	cam_csi_update(csi, CSIS_PHY_CMN_CTRL, CSIS_PHY_EN_CLK,
++		       CSIS_PHY_EN_CLK);
++	cam_csi_update(csi, CSIS_PHY_CMN_CTRL, CSIS_PHY_EN_DAT,
++		       ((1U << csi->lanes) - 1) << 1);
++	cam_csi_update(csi, CSIS_CMN_CTRL, CSIS_CMN_CSI_EN, CSIS_CMN_CSI_EN);
++}
++
++static void cam_csis_pattern(struct cam_csi *csi, bool on)
++{
++	u32 width = csi->width;
++	u32 height = csi->height;
++	u32 clk_mhz = 533;
++	u32 vvalid, vblank, vblank_size;
++	u32 val;
++
++	if (!on) {
++		val = cam_read(csi, csi->cdma, CDMA_TEST_ENABLE);
++		cam_write(csi, csi->cdma, CDMA_TEST_ENABLE,
++			  val & ~CDMA_TEST_ENABLE_TP);
++		return;
++	}
++
++	vvalid = (width * height) / (clk_mhz * 2);
++	vblank = (1000000 / 30) - vvalid;
++	if ((int)vblank < 0)
++		vblank = 1000;
++	vblank_size = vblank * clk_mhz;
++
++	val = (0x80 << 16) | (70 << 8) | 0x40;
++	cam_write(csi, csi->cdma, CDMA_TEST_CTRL, val);
++	cam_write(csi, csi->cdma, CDMA_TEST_RESOL,
++		  (height << 16) | width);
++
++	val = cam_read(csi, csi->cdma, CDMA_TEST_ENABLE);
++	val &= ~(CDMA_TEST_ENABLE_PPC | CDMA_TEST_ENABLE_VBLANK);
++	val |= CDMA_TEST_ENABLE_PPC | (vblank_size & CDMA_TEST_ENABLE_VBLANK);
++	val |= CDMA_TEST_ENABLE_TP;
++	cam_write(csi, csi->cdma, CDMA_TEST_ENABLE, val);
++}
++
++/* ------------------------------------------------------------------ */
++/* vb2 queue                                                          */
++/* ------------------------------------------------------------------ */
++
++static int cam_queue_setup(struct vb2_queue *q, unsigned int *count,
++			   unsigned int *num_planes, unsigned int sizes[],
++			   struct device *alloc_devs[])
++{
++	struct cam_csi *csi = vb2_get_drv_priv(q);
++	unsigned int size = cam_fmt_sizeimage(csi->width, csi->height);
++
++	if (*num_planes) {
++		if (sizes[0] < size)
++			return -EINVAL;
++		return 0;
++	}
++
++	if (*count < 2)
++		*count = 2;
++	if (*count > CAM_MAX_BUFFERS)
++		*count = CAM_MAX_BUFFERS;
++
++	*num_planes = 1;
++	sizes[0] = size;
++	return 0;
++}
++
++static void cam_buf_queue(struct vb2_buffer *vb)
++{
++	struct cam_csi *csi = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct cam_slot *slot = NULL;
++	dma_addr_t addr;
++	unsigned long flags;
++	unsigned int i;
++
++	addr = vb2_dma_contig_plane_dma_addr(vb, 0);
++
++	spin_lock_irqsave(&csi->slock, flags);
++	for (i = 0; i < CAM_NUM_SLOTS; i++) {
++		if (!csi->slots[i].vb) {
++			slot = &csi->slots[i];
++			break;
++		}
++	}
++	if (!slot) {
++		spin_unlock_irqrestore(&csi->slock, flags);
++		dev_warn_ratelimited(csi->dev, "no free DMA slot\n");
++		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
++		return;
++	}
++
++	slot->vb = vbuf;
++	slot->addr = addr;
++	if (csi->streaming)
++		cam_write(csi, csi->vcdma, VCDMA_ADDR(i + 1),
++			  lower_32_bits(addr));
++	spin_unlock_irqrestore(&csi->slock, flags);
++}
++
++static int cam_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct cam_csi *csi = vb2_get_drv_priv(q);
++	unsigned int mode;
++	unsigned long flags;
++	int ret;
++
++	if (!csi->sensor) {
++		dev_err(csi->dev, "no sensor bound\n");
++		return -ENODEV;
++	}
++	if (!test_pattern && !csi->sensor->present) {
++		dev_err(csi->dev, "%s did not respond; use test_pattern=1\n",
++			csi->sensor->cfg->name);
++		return -ENODEV;
++	}
++	mode = csi->mode;
++	csi->width = csi->sensor->cfg->modes[mode].width;
++	csi->height = csi->sensor->cfg->modes[mode].height;
++
++	/* Fill the entire ring; unused slots point at the scratch buffer. */
++	spin_lock_irqsave(&csi->slock, flags);
++	for (unsigned int i = 0; i < CAM_NUM_SLOTS; i++) {
++		dma_addr_t addr = csi->slots[i].vb ? csi->slots[i].addr :
++				   csi->scratch_addr;
++		csi->slots[i].addr = addr;
++		cam_write(csi, csi->vcdma, VCDMA_ADDR(i + 1),
++			  lower_32_bits(addr));
++		if (!csi->slots[i].vb)
++			csi->slots[i].addr = csi->scratch_addr;
++	}
++	csi->streaming = true;
++	spin_unlock_irqrestore(&csi->slock, flags);
++
++	cam_csis_phy_power(csi, true);
++	ret = cam_csis_config(csi, csi->width, csi->height,
++			      csi->sensor->cfg->modes[mode].lanes,
++			      csi->sensor->cfg->modes[mode].mipi_mbps);
++	if (ret)
++		goto err_phy;
++
++	cam_csis_start_dma(csi);
++	if (test_pattern) {
++		cam_csis_pattern(csi, true);
++	} else {
++		cam_csis_enable(csi, true);
++
++		mutex_lock(&csi->sensor->lock);
++		ret = cam_sensor_power_on(csi->sensor);
++		if (!ret)
++			ret = cam_sensor_stream_on(csi->sensor);
++		mutex_unlock(&csi->sensor->lock);
++		if (ret)
++			goto err_dma;
++	}
++
++	csi->sequence = 0;
++	csi->error_count = 0;
++	csi->debug_frames = 0;
++	return 0;
++
++err_dma:
++	cam_csis_stop_dma(csi);
++	cam_csis_enable(csi, false);
++err_phy:
++	cam_csis_phy_power(csi, false);
++	return ret;
++}
++
++static void cam_stop_streaming(struct vb2_queue *q)
++{
++	struct cam_csi *csi = vb2_get_drv_priv(q);
++	unsigned long flags;
++	unsigned int i;
++
++	if (csi->sensor && csi->sensor->present) {
++		mutex_lock(&csi->sensor->lock);
++		cam_sensor_stream_off(csi->sensor);
++		cam_sensor_power_off(csi->sensor);
++		mutex_unlock(&csi->sensor->lock);
++	}
++
++	cam_csis_enable(csi, false);
++	cam_csis_stop_dma(csi);
++	cam_csis_pattern(csi, false);
++	cam_csis_phy_power(csi, false);
++
++	spin_lock_irqsave(&csi->slock, flags);
++	csi->streaming = false;
++	for (i = 0; i < CAM_NUM_SLOTS; i++) {
++		struct cam_slot *slot = &csi->slots[i];
++
++		if (slot->vb) {
++			vb2_buffer_done(&slot->vb->vb2_buf,
++					VB2_BUF_STATE_ERROR);
++			slot->vb = NULL;
++		}
++	}
++	spin_unlock_irqrestore(&csi->slock, flags);
++}
++
++static const struct vb2_ops cam_vb2_ops = {
++	.queue_setup = cam_queue_setup,
++	.buf_queue = cam_buf_queue,
++	.start_streaming = cam_start_streaming,
++	.stop_streaming = cam_stop_streaming,
++};
++
++/* ------------------------------------------------------------------ */
++/* Interrupts                                                         */
++/* ------------------------------------------------------------------ */
++
++static void cam_csi_irq_log(struct cam_csi *csi, u32 src0, u32 src1)
++{
++	if (time_after(jiffies, csi->last_error_jiffies + HZ)) {
++		dev_warn_ratelimited(csi->dev,
++				     "CSIS error src0=0x%08x src1=0x%08x\n",
++				     src0, src1);
++		csi->last_error_jiffies = jiffies;
++	}
++	csi->error_count++;
++}
++
++static irqreturn_t cam_csi_isr(int irq, void *data)
++{
++	struct cam_csi *csi = data;
++	u32 src0, src1;
++
++	src0 = cam_read(csi, csi->csi, CSIS_INT_SRC0);
++	src1 = cam_read(csi, csi->csi, CSIS_INT_SRC1);
++	if (!src0 && !src1)
++		return IRQ_NONE;
++
++	cam_write(csi, csi->csi, CSIS_INT_SRC0, src0);
++	cam_write(csi, csi->csi, CSIS_INT_SRC1, src1);
++
++	/* The unmasked error bits are not part of the frame counters. */
++	if (src0 & 0x000ffff0)
++		cam_csi_irq_log(csi, src0, src1);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t cam_csis_dma_isr(int irq, void *data)
++{
++	struct cam_csi *csi = data;
++	struct cam_slot *slot;
++	unsigned long flags;
++	u32 src;
++
++	src = cam_read(csi, csi->vcdma, VCDMA_CMN_INT_SRC);
++	if (!src)
++		return IRQ_NONE;
++
++	cam_write(csi, csi->vcdma, VCDMA_CMN_INT_SRC, src);
++
++	if (src & VCDMA_CMN_INT_ERROR)
++		cam_csi_irq_log(csi, 0, src);
++
++	if (!(src & VCDMA_CMN_INT_FRM_END(0)))
++		return IRQ_HANDLED;
++
++	spin_lock_irqsave(&csi->slock, flags);
++	slot = &csi->slots[csi->next_slot];
++	if (slot->vb) {
++		slot->vb->vb2_buf.timestamp = ktime_get_ns();
++		slot->vb->sequence = csi->sequence;
++		slot->vb->field = V4L2_FIELD_NONE;
++		vb2_buffer_done(&slot->vb->vb2_buf, VB2_BUF_STATE_DONE);
++		slot->vb = NULL;
++		slot->addr = csi->scratch_addr;
++		/* Replace the finished slot with the scratch buffer. */
++		cam_write(csi, csi->vcdma, VCDMA_ADDR(csi->next_slot + 1),
++			  lower_32_bits(csi->scratch_addr));
++	}
++	csi->next_slot = (csi->next_slot + 1) % CAM_NUM_SLOTS;
++	csi->sequence++;
++	if (csi->debug_frames < 5) {
++		dev_info(csi->dev,
++			 "frame %u: slot %u active 0x%08x src 0x%08x\n",
++			 csi->sequence, csi->next_slot,
++			 cam_read(csi, csi->vcdma, VCDMA_ACT_CTRL), src);
++		csi->debug_frames++;
++	}
++	spin_unlock_irqrestore(&csi->slock, flags);
++
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------ */
++/* V4L2 ioctls                                                        */
++/* ------------------------------------------------------------------ */
++
++static int cam_v4l2_querycap(struct file *file, void *priv,
++			     struct v4l2_capability *cap)
++{
++	struct cam_csi *csi = video_drvdata(file);
++
++	strscpy(cap->driver, CAM_DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->card, csi->sensor ? csi->sensor->cfg->name : "CSIS",
++		sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 dev_name(csi->dev));
++	return 0;
++}
++
++static int cam_v4l2_enum_fmt(struct file *file, void *priv,
++			     struct v4l2_fmtdesc *f)
++{
++	struct cam_csi *csi = video_drvdata(file);
++
++	if (!csi->sensor)
++		return -ENODEV;
++	if (f->index >= csi->sensor->cfg->nmodes)
++		return -EINVAL;
++	if (f->mbus_code)
++		return -EINVAL;
++
++	f->pixelformat = V4L2_PIX_FMT_SBGGR10P;
++	f->description[0] = '\0';
++	return 0;
++}
++
++static int cam_v4l2_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct cam_csi *csi = video_drvdata(file);
++
++	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++
++	f->fmt.pix.width = csi->width;
++	f->fmt.pix.height = csi->height;
++	f->fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR10P;
++	f->fmt.pix.field = V4L2_FIELD_NONE;
++	f->fmt.pix.bytesperline = cam_fmt_bytesperline(csi->width);
++	f->fmt.pix.sizeimage = cam_fmt_sizeimage(csi->width, csi->height);
++	f->fmt.pix.colorspace = V4L2_COLORSPACE_RAW;
++	return 0;
++}
++
++static int cam_find_mode(struct cam_csi *csi, u32 width, u32 height)
++{
++	const struct cam_sensor_cfg *cfg = csi->sensor->cfg;
++	unsigned int i;
++
++	if (!width || !height)
++		return 0;
++	for (i = 0; i < cfg->nmodes; i++) {
++		if (cfg->modes[i].width == width && cfg->modes[i].height == height)
++			return i;
++	}
++	return -EINVAL;
++}
++
++static int cam_v4l2_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct cam_csi *csi = video_drvdata(file);
++	int mode;
++
++	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++	if (!csi->sensor)
++		return -ENODEV;
++
++	mode = cam_find_mode(csi, f->fmt.pix.width, f->fmt.pix.height);
++	if (mode < 0)
++		mode = 0;
++
++	f->fmt.pix.width = csi->sensor->cfg->modes[mode].width;
++	f->fmt.pix.height = csi->sensor->cfg->modes[mode].height;
++	f->fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR10P;
++	f->fmt.pix.field = V4L2_FIELD_NONE;
++	f->fmt.pix.bytesperline = cam_fmt_bytesperline(f->fmt.pix.width);
++	f->fmt.pix.sizeimage = cam_fmt_sizeimage(f->fmt.pix.width,
++						 f->fmt.pix.height);
++	f->fmt.pix.colorspace = V4L2_COLORSPACE_RAW;
++	return 0;
++}
++
++static int cam_v4l2_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct cam_csi *csi = video_drvdata(file);
++	int mode;
++
++	if (vb2_is_busy(&csi->queue))
++		return -EBUSY;
++
++	mode = cam_find_mode(csi, f->fmt.pix.width, f->fmt.pix.height);
++	if (mode < 0)
++		return -EINVAL;
++
++	csi->mode = mode;
++	csi->width = csi->sensor->cfg->modes[mode].width;
++	csi->height = csi->sensor->cfg->modes[mode].height;
++	mutex_lock(&csi->sensor->lock);
++	csi->sensor->mode = mode;
++	mutex_unlock(&csi->sensor->lock);
++
++	return cam_v4l2_try_fmt(file, priv, f);
++}
++
++static int cam_v4l2_enum_input(struct file *file, void *priv,
++			       struct v4l2_input *inp)
++{
++	if (inp->index)
++		return -EINVAL;
++	strscpy(inp->name, "camera", sizeof(inp->name));
++	inp->type = V4L2_INPUT_TYPE_CAMERA;
++	return 0;
++}
++
++static int cam_v4l2_g_input(struct file *file, void *priv, unsigned int *i)
++{
++	*i = 0;
++	return 0;
++}
++
++static int cam_v4l2_s_input(struct file *file, void *priv, unsigned int i)
++{
++	return i ? -EINVAL : 0;
++}
++
++static int cam_ctrl_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct cam_csi *csi = container_of(ctrl->handler, struct cam_csi,
++					   ctrl_handler);
++	struct cam_sensor *sensor = csi->sensor;
++	int ret;
++
++	if (!sensor)
++		return -ENODEV;
++
++	mutex_lock(&sensor->lock);
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		ret = cam_i2c_write(sensor, 0x0202, ctrl->val, 2);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		ret = cam_i2c_write(sensor, 0x0204, ctrl->val, 2);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++	mutex_unlock(&sensor->lock);
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops cam_ctrl_ops = {
++	.s_ctrl = cam_ctrl_s_ctrl,
++};
++
++static const struct v4l2_ioctl_ops cam_ioctl_ops = {
++	.vidioc_querycap = cam_v4l2_querycap,
++	.vidioc_enum_fmt_vid_cap = cam_v4l2_enum_fmt,
++	.vidioc_g_fmt_vid_cap = cam_v4l2_g_fmt,
++	.vidioc_try_fmt_vid_cap = cam_v4l2_try_fmt,
++	.vidioc_s_fmt_vid_cap = cam_v4l2_s_fmt,
++	.vidioc_enum_input = cam_v4l2_enum_input,
++	.vidioc_g_input = cam_v4l2_g_input,
++	.vidioc_s_input = cam_v4l2_s_input,
++
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++};
++
++static const struct v4l2_file_operations cam_fops = {
++	.owner = THIS_MODULE,
++	.open = v4l2_fh_open,
++	.release = vb2_fop_release,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = vb2_fop_mmap,
++	.poll = vb2_fop_poll,
++};
++
++/* ------------------------------------------------------------------ */
++/* Probe / remove                                                     */
++/* ------------------------------------------------------------------ */
++
++static struct cam_sensor *cam_find_sensor(struct cam_csi *csi)
++{
++	struct device_node *np = csi->dev->of_node;
++	struct device_node *sensor_np;
++	struct i2c_client *client;
++	struct cam_sensor *sensor = NULL;
++
++	sensor_np = of_parse_phandle(np, "sensor", 0);
++	if (!sensor_np)
++		return ERR_PTR(-ENODEV);
++
++	client = of_find_i2c_device_by_node(sensor_np);
++	of_node_put(sensor_np);
++	if (!client)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	sensor = i2c_get_clientdata(client);
++	if (sensor && sensor->magic == CAM_MAGIC) {
++		get_device(&client->dev);
++		return sensor;
++	}
++	return ERR_PTR(-EPROBE_DEFER);
++}
++
++static ssize_t regs_show(struct device *dev, struct device_attribute *attr,
++			 char *buf)
++{
++	struct cam_csi *csi = dev_get_drvdata(dev);
++	ssize_t n = 0;
++	unsigned int i;
++
++	n += sysfs_emit_at(buf, n, "csi: ");
++	for (i = 0; i <= 0x1c; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->csi, i));
++	n += sysfs_emit_at(buf, n, "\nisp: ");
++	for (i = 0x40; i <= 0x48; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->csi, i));
++	n += sysfs_emit_at(buf, n, "\nphy: ");
++	for (i = 0; i <= 0x24; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->phy, i));
++	n += sysfs_emit_at(buf, n, "\nphyhi: ");
++	for (i = 0x48; i <= 0x50; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->phy, i));
++	n += sysfs_emit_at(buf, n, "\nvc: ");
++	for (i = 0; i <= 0x54; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->vcdma, i));
++	n += sysfs_emit_at(buf, n, "\nvccmn: ");
++	for (i = 0x400; i <= 0x41c; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->vcdma, i));
++	n += sysfs_emit_at(buf, n, "\ncdma: ");
++	for (i = 0; i <= 0x28; i += 4)
++		n += sysfs_emit_at(buf, n, "%08x ", cam_read(csi, csi->cdma, i));
++	n += sysfs_emit_at(buf, n, "\n");
++	return n;
++}
++static DEVICE_ATTR_RO(regs);
++
++static int cam_csi_probe(struct platform_device *pdev)
++{
++	struct cam_csi *csi;
++	struct resource *res;
++	int ret;
++
++	if (csi_disabled)
++		return -ENODEV;
++
++	csi = devm_kzalloc(&pdev->dev, sizeof(*csi), GFP_KERNEL);
++	if (!csi)
++		return -ENOMEM;
++
++	csi->dev = &pdev->dev;
++	if (device_property_read_u32(&pdev->dev, "samsung,csi-port",
++				     &csi->port)) {
++		dev_err(&pdev->dev, "missing samsung,csi-port\n");
++		return -EINVAL;
++	}
++	mutex_init(&csi->lock);
++	spin_lock_init(&csi->slock);
++
++	csi->csi = devm_platform_ioremap_resource_byname(pdev, "csi");
++	if (IS_ERR(csi->csi))
++		return PTR_ERR(csi->csi);
++	csi->phy = devm_platform_ioremap_resource_byname(pdev, "phy");
++	if (IS_ERR(csi->phy))
++		return PTR_ERR(csi->phy);
++	csi->vcdma = devm_platform_ioremap_resource_byname(pdev, "vc-dma");
++	if (IS_ERR(csi->vcdma))
++		return PTR_ERR(csi->vcdma);
++	/*
++	 * The common DMA block is shared by both CSIS ports, so it cannot be
++	 * claimed exclusively with devm_platform_ioremap_resource_byname().
++	 */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "common-dma");
++	if (!res)
++		return -ENODEV;
++	csi->cdma = devm_ioremap(&pdev->dev, res->start, resource_size(res));
++	if (!csi->cdma)
++		return -ENOMEM;
++
++	csi->irq_csi = platform_get_irq_byname(pdev, "csi");
++	if (csi->irq_csi < 0)
++		return csi->irq_csi;
++	csi->irq_dma = platform_get_irq_byname(pdev, "dma");
++	if (csi->irq_dma < 0)
++		return csi->irq_dma;
++
++	csi->clk_csis = devm_clk_get(&pdev->dev, "csis");
++	csi->clk_glue = devm_clk_get(&pdev->dev, "glue");
++	csi->clk_dma = devm_clk_get(&pdev->dev, "dma");
++	csi->clk_pclk = devm_clk_get(&pdev->dev, "pclk");
++	csi->clk_bus = devm_clk_get_optional(&pdev->dev, "bus");
++	if (IS_ERR(csi->clk_csis) || IS_ERR(csi->clk_glue) ||
++	    IS_ERR(csi->clk_dma) || IS_ERR(csi->clk_pclk))
++		return -EPROBE_DEFER;
++
++	csi->pmu = syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
++						   "samsung,pmu-syscon");
++	if (IS_ERR(csi->pmu)) {
++		dev_warn(&pdev->dev, "no PMU syscon; D-PHY isolation not touched\n");
++		csi->pmu = NULL;
++	}
++	if (device_property_read_u32(&pdev->dev, "samsung,phy-isolation",
++				     &csi->iso_offset))
++		csi->iso_offset = 0;
++
++	csi->cmu = syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
++						   "samsung,cmu-syscon");
++	if (IS_ERR(csi->cmu)) {
++		dev_warn(&pdev->dev, "no CMU syscon; cannot enable CAM QCH\n");
++		csi->cmu = NULL;
++	} else {
++		/*
++		 * The CAM block clocks are hardware-auto-gated.  The CMU QCH
++		 * enable/request bits have to be asserted before the CSIS
++		 * registers can be accessed.
++		 */
++		unsigned int off;
++
++		for (off = 0x3020; off <= 0x303c; off += 4)
++			regmap_update_bits(csi->cmu, off, 0x7, 0x7);
++	}
++
++	ret = clk_prepare_enable(csi->clk_csis);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(csi->clk_glue);
++	if (ret)
++		goto err_csis;
++	ret = clk_prepare_enable(csi->clk_dma);
++	if (ret)
++		goto err_glue;
++	ret = clk_prepare_enable(csi->clk_pclk);
++	if (ret)
++		goto err_dma;
++	if (csi->clk_bus)
++		clk_prepare_enable(csi->clk_bus);
++
++	dev_info(&pdev->dev, "bus clock %lu Hz\n",
++		 csi->clk_bus ? clk_get_rate(csi->clk_bus) : 0);
++
++	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
++	if (ret) {
++		dev_err(&pdev->dev, "no 32-bit DMA mask\n");
++		goto err_clocks;
++	}
++
++	csi->sensor = cam_find_sensor(csi);
++	if (IS_ERR(csi->sensor)) {
++		ret = PTR_ERR(csi->sensor);
++		csi->sensor = NULL;
++		dev_dbg(&pdev->dev, "sensor not ready (%d), deferring\n", ret);
++		goto err_clocks;
++	}
++
++	csi->mode = 0;
++	csi->width = csi->sensor->cfg->modes[0].width;
++	csi->height = csi->sensor->cfg->modes[0].height;
++	csi->scratch_size = cam_fmt_sizeimage(csi->width, csi->height);
++	csi->scratch = dma_alloc_coherent(&pdev->dev, csi->scratch_size,
++					  &csi->scratch_addr, GFP_KERNEL);
++	if (!csi->scratch) {
++		ret = -ENOMEM;
++		goto err_sensor;
++	}
++
++	csi->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	csi->queue.io_modes = VB2_MMAP | VB2_DMABUF;
++	csi->queue.ops = &cam_vb2_ops;
++	csi->queue.mem_ops = &vb2_dma_contig_memops;
++	csi->queue.drv_priv = csi;
++	csi->queue.buf_struct_size = sizeof(struct cam_buffer);
++	csi->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	csi->queue.lock = &csi->lock;
++	csi->queue.dev = &pdev->dev;
++	ret = vb2_queue_init(&csi->queue);
++	if (ret)
++		goto err_scratch;
++
++	ret = v4l2_device_register(&pdev->dev, &csi->v4l2_dev);
++	if (ret)
++		goto err_scratch;
++
++	v4l2_ctrl_handler_init(&csi->ctrl_handler, 2);
++	v4l2_ctrl_new_std(&csi->ctrl_handler, &cam_ctrl_ops, V4L2_CID_EXPOSURE,
++			  1, 0xffff, 1, 0x0dd8);
++	v4l2_ctrl_new_std(&csi->ctrl_handler, &cam_ctrl_ops,
++			  V4L2_CID_ANALOGUE_GAIN, 0, 0xffff, 1, 0x20);
++	if (csi->ctrl_handler.error) {
++		ret = csi->ctrl_handler.error;
++		goto err_ctrl;
++	}
++
++	csi->vdev = (struct video_device) {
++		.name = "exynos9610-csis",
++		.vfl_dir = VFL_DIR_RX,
++		.fops = &cam_fops,
++		.ioctl_ops = &cam_ioctl_ops,
++		.release = video_device_release_empty,
++		.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING,
++		.lock = &csi->lock,
++		.queue = &csi->queue,
++	};
++	snprintf(csi->vdev.name, sizeof(csi->vdev.name), "exynos9610-csis%d",
++		 csi->port);
++	csi->vdev.v4l2_dev = &csi->v4l2_dev;
++	csi->vdev.ctrl_handler = &csi->ctrl_handler;
++	video_set_drvdata(&csi->vdev, csi);
++
++	ret = video_register_device(&csi->vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		dev_err(&pdev->dev, "video_register_device failed: %d\n", ret);
++		goto err_ctrl;
++	}
++
++	ret = request_irq(csi->irq_csi, cam_csi_isr, IRQF_SHARED,
++			  dev_name(&pdev->dev), csi);
++	if (ret)
++		goto err_video;
++	ret = request_irq(csi->irq_dma, cam_csis_dma_isr, IRQF_SHARED,
++			  dev_name(&pdev->dev), csi);
++	if (ret)
++		goto err_irq_csi;
++
++	platform_set_drvdata(pdev, csi);
++	device_create_file(&pdev->dev, &dev_attr_regs);
++	dev_info(&pdev->dev, "capture ready for %s, /dev/video%d\n",
++		 csi->sensor->cfg->name, csi->vdev.num);
++	return 0;
++
++err_irq_csi:
++	free_irq(csi->irq_csi, csi);
++err_video:
++	vb2_video_unregister_device(&csi->vdev);
++err_ctrl:
++	v4l2_ctrl_handler_free(&csi->ctrl_handler);
++	v4l2_device_unregister(&csi->v4l2_dev);
++err_scratch:
++	dma_free_coherent(&pdev->dev, csi->scratch_size, csi->scratch,
++			  csi->scratch_addr);
++err_sensor:
++	if (csi->sensor)
++		put_device(&csi->sensor->client->dev);
++err_clocks:
++	if (csi->clk_bus)
++		clk_disable_unprepare(csi->clk_bus);
++	clk_disable_unprepare(csi->clk_pclk);
++err_dma:
++	clk_disable_unprepare(csi->clk_dma);
++err_glue:
++	clk_disable_unprepare(csi->clk_glue);
++err_csis:
++	clk_disable_unprepare(csi->clk_csis);
++	return ret;
++}
++
++static void cam_csi_remove(struct platform_device *pdev)
++{
++	struct cam_csi *csi = platform_get_drvdata(pdev);
++
++	device_remove_file(&pdev->dev, &dev_attr_regs);
++	free_irq(csi->irq_dma, csi);
++	free_irq(csi->irq_csi, csi);
++	vb2_video_unregister_device(&csi->vdev);
++	v4l2_ctrl_handler_free(&csi->ctrl_handler);
++	v4l2_device_unregister(&csi->v4l2_dev);
++	dma_free_coherent(&pdev->dev, csi->scratch_size, csi->scratch,
++			  csi->scratch_addr);
++	if (csi->sensor)
++		put_device(&csi->sensor->client->dev);
++	if (csi->clk_bus)
++		clk_disable_unprepare(csi->clk_bus);
++	clk_disable_unprepare(csi->clk_pclk);
++	clk_disable_unprepare(csi->clk_dma);
++	clk_disable_unprepare(csi->clk_glue);
++	clk_disable_unprepare(csi->clk_csis);
++}
++
++static const struct of_device_id cam_csi_of_match[] = {
++	{ .compatible = "samsung,exynos9610-csis" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, cam_csi_of_match);
++
++static struct platform_driver cam_csi_driver = {
++	.probe = cam_csi_probe,
++	.remove = cam_csi_remove,
++	.driver = {
++		.name = "exynos9610-csis",
++		.of_match_table = cam_csi_of_match,
++	},
++};
++
++static int __init cam_init(void)
++{
++	int ret;
++
++	ret = i2c_add_driver(&cam_sensor_i2c_driver);
++	if (ret)
++		return ret;
++	ret = platform_driver_register(&cam_csi_driver);
++	if (ret)
++		i2c_del_driver(&cam_sensor_i2c_driver);
++	return ret;
++}
++
++static void __exit cam_exit(void)
++{
++	platform_driver_unregister(&cam_csi_driver);
++	i2c_del_driver(&cam_sensor_i2c_driver);
++}
++
++module_init(cam_init);
++module_exit(cam_exit);
++
++MODULE_DESCRIPTION("Exynos9610 gta4xl S5K4HA/S5K5E9 CSIS capture");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/samsung/exynos9610-camera-tables.h b/drivers/media/platform/samsung/exynos9610-camera-tables.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/platform/samsung/exynos9610-camera-tables.h
+@@ -0,0 +1,321 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Sensor register tables extracted from the Samsung/LineageOS 4.14
++ * gta4xl camera stack (fimc-is-cis-4ha-setB.h, fimc-is-cis-5e9-setB.h).
++ * Entries are (address, value, access width in bytes); the values are
++ * written verbatim, exactly as the vendor driver writes them.
++ */
++#ifndef __EXYNOS9610_CAMERA_TABLES_H__
++#define __EXYNOS9610_CAMERA_TABLES_H__
++
++struct cam_reg {
++	u16 addr;
++	u8 width;
++	u8 reserved;
++	u32 val;
++};
++
++static const struct cam_reg cam_4ha_global[] = {
++	{ 0x0100, 1, 0, 0x0000 },
++	{ 0x0a02, 1, 0, 0x007f },
++	{ 0x3b45, 1, 0, 0x0001 },
++	{ 0x3264, 1, 0, 0x0001 },
++	{ 0x3290, 1, 0, 0x0010 },
++	{ 0x0b05, 1, 0, 0x0001 },
++	{ 0x3069, 1, 0, 0x00c7 },
++	{ 0x3074, 1, 0, 0x0006 },
++	{ 0x3075, 1, 0, 0x0032 },
++	{ 0x3068, 1, 0, 0x00f7 },
++	{ 0x30c6, 1, 0, 0x0001 },
++	{ 0x301f, 1, 0, 0x0020 },
++	{ 0x306b, 1, 0, 0x009a },
++	{ 0x3091, 1, 0, 0x001f },
++	{ 0x306e, 1, 0, 0x0071 },
++	{ 0x306f, 1, 0, 0x0028 },
++	{ 0x306d, 1, 0, 0x0008 },
++	{ 0x3084, 1, 0, 0x0016 },
++	{ 0x3070, 1, 0, 0x000f },
++	{ 0x306a, 1, 0, 0x0079 },
++	{ 0x30b0, 1, 0, 0x00ff },
++	{ 0x30c2, 1, 0, 0x0005 },
++	{ 0x30c4, 1, 0, 0x0006 },
++	{ 0x3081, 1, 0, 0x0007 },
++	{ 0x307b, 1, 0, 0x0085 },
++	{ 0x307a, 1, 0, 0x000a },
++	{ 0x3079, 1, 0, 0x000a },
++	{ 0x308a, 1, 0, 0x0020 },
++	{ 0x308b, 1, 0, 0x0008 },
++	{ 0x308c, 1, 0, 0x000b },
++	{ 0x392f, 1, 0, 0x0001 },
++	{ 0x3930, 1, 0, 0x0000 },
++	{ 0x3924, 1, 0, 0x007f },
++	{ 0x3925, 1, 0, 0x00fd },
++	{ 0x3c08, 1, 0, 0x00ff },
++	{ 0x3c09, 1, 0, 0x00ff },
++	{ 0x3c31, 1, 0, 0x00ff },
++	{ 0x3c32, 1, 0, 0x00ff },
++};
++
++static const struct cam_reg cam_4ha_1632x1224_30fps[] = {
++	{ 0x0136, 1, 0, 0x001a },
++	{ 0x0137, 1, 0, 0x0000 },
++	{ 0x0301, 1, 0, 0x0004 },
++	{ 0x0305, 1, 0, 0x0005 },
++	{ 0x0306, 1, 0, 0x0000 },
++	{ 0x0307, 1, 0, 0x006c },
++	{ 0x3c1f, 1, 0, 0x0000 },
++	{ 0x030d, 1, 0, 0x0005 },
++	{ 0x030e, 1, 0, 0x0000 },
++	{ 0x030f, 1, 0, 0x0081 },
++	{ 0x3c17, 1, 0, 0x0000 },
++	{ 0x0340, 1, 0, 0x0009 },
++	{ 0x0341, 1, 0, 0x00ea },
++	{ 0x0342, 1, 0, 0x000e },
++	{ 0x0343, 1, 0, 0x0068 },
++	{ 0x0344, 1, 0, 0x0000 },
++	{ 0x0345, 1, 0, 0x0008 },
++	{ 0x0346, 1, 0, 0x0000 },
++	{ 0x0347, 1, 0, 0x0008 },
++	{ 0x0348, 1, 0, 0x000c },
++	{ 0x0349, 1, 0, 0x00c7 },
++	{ 0x034a, 1, 0, 0x0009 },
++	{ 0x034b, 1, 0, 0x0097 },
++	{ 0x034c, 1, 0, 0x0006 },
++	{ 0x034d, 1, 0, 0x0060 },
++	{ 0x034e, 1, 0, 0x0004 },
++	{ 0x034f, 1, 0, 0x00c8 },
++	{ 0x0381, 1, 0, 0x0001 },
++	{ 0x0383, 1, 0, 0x0001 },
++	{ 0x0385, 1, 0, 0x0001 },
++	{ 0x0387, 1, 0, 0x0003 },
++	{ 0x0900, 1, 0, 0x0001 },
++	{ 0x0901, 1, 0, 0x0022 },
++	{ 0x0204, 1, 0, 0x0000 },
++	{ 0x0205, 1, 0, 0x0020 },
++	{ 0x0200, 1, 0, 0x000d },
++	{ 0x0201, 1, 0, 0x00d8 },
++	{ 0x0202, 1, 0, 0x0000 },
++	{ 0x0203, 1, 0, 0x0002 },
++	{ 0x0820, 1, 0, 0x0002 },
++	{ 0x0821, 1, 0, 0x009f },
++	{ 0x0822, 1, 0, 0x0000 },
++	{ 0x0823, 1, 0, 0x0000 },
++	{ 0x0112, 1, 0, 0x000a },
++	{ 0x0113, 1, 0, 0x000a },
++	{ 0x0114, 1, 0, 0x0003 },
++	{ 0x3929, 1, 0, 0x003f },
++	{ 0x0101, 1, 0, 0x0000 },
++	{ 0x3941, 1, 0, 0x000f },
++	{ 0x3942, 1, 0, 0x003d },
++};
++
++static const struct cam_reg cam_4ha_3264x2448_30fps[] = {
++	{ 0x0136, 1, 0, 0x001a },
++	{ 0x0137, 1, 0, 0x0000 },
++	{ 0x0301, 1, 0, 0x0004 },
++	{ 0x0305, 1, 0, 0x0005 },
++	{ 0x0306, 1, 0, 0x0000 },
++	{ 0x0307, 1, 0, 0x006c },
++	{ 0x3c1f, 1, 0, 0x0000 },
++	{ 0x030d, 1, 0, 0x0005 },
++	{ 0x030e, 1, 0, 0x0000 },
++	{ 0x030f, 1, 0, 0x0081 },
++	{ 0x3c17, 1, 0, 0x0000 },
++	{ 0x0340, 1, 0, 0x0009 },
++	{ 0x0341, 1, 0, 0x00ea },
++	{ 0x0342, 1, 0, 0x000e },
++	{ 0x0343, 1, 0, 0x0068 },
++	{ 0x0344, 1, 0, 0x0000 },
++	{ 0x0345, 1, 0, 0x0008 },
++	{ 0x0346, 1, 0, 0x0000 },
++	{ 0x0347, 1, 0, 0x0008 },
++	{ 0x0348, 1, 0, 0x000c },
++	{ 0x0349, 1, 0, 0x00c7 },
++	{ 0x034a, 1, 0, 0x0009 },
++	{ 0x034b, 1, 0, 0x0097 },
++	{ 0x034c, 1, 0, 0x000c },
++	{ 0x034d, 1, 0, 0x00c0 },
++	{ 0x034e, 1, 0, 0x0009 },
++	{ 0x034f, 1, 0, 0x0090 },
++	{ 0x0381, 1, 0, 0x0001 },
++	{ 0x0383, 1, 0, 0x0001 },
++	{ 0x0385, 1, 0, 0x0001 },
++	{ 0x0387, 1, 0, 0x0001 },
++	{ 0x0900, 1, 0, 0x0000 },
++	{ 0x0901, 1, 0, 0x0000 },
++	{ 0x0204, 1, 0, 0x0000 },
++	{ 0x0205, 1, 0, 0x0020 },
++	{ 0x0200, 1, 0, 0x000d },
++	{ 0x0201, 1, 0, 0x00d8 },
++	{ 0x0202, 1, 0, 0x0000 },
++	{ 0x0203, 1, 0, 0x0002 },
++	{ 0x0820, 1, 0, 0x0002 },
++	{ 0x0821, 1, 0, 0x009f },
++	{ 0x0822, 1, 0, 0x0000 },
++	{ 0x0823, 1, 0, 0x0000 },
++	{ 0x0112, 1, 0, 0x000a },
++	{ 0x0113, 1, 0, 0x000a },
++	{ 0x0114, 1, 0, 0x0003 },
++	{ 0x3929, 1, 0, 0x003f },
++	{ 0x0101, 1, 0, 0x0000 },
++	{ 0x3941, 1, 0, 0x000f },
++	{ 0x3942, 1, 0, 0x003d },
++};
++
++static const struct cam_reg cam_5e9_global[] = {
++	{ 0x0100, 1, 0, 0x0000 },
++	{ 0x0a02, 1, 0, 0x003f },
++	{ 0x3b45, 1, 0, 0x0001 },
++	{ 0x3290, 1, 0, 0x0010 },
++	{ 0x0b05, 1, 0, 0x0001 },
++	{ 0x3069, 1, 0, 0x0087 },
++	{ 0x3074, 1, 0, 0x0006 },
++	{ 0x3075, 1, 0, 0x002f },
++	{ 0x301f, 1, 0, 0x0020 },
++	{ 0x306b, 1, 0, 0x009a },
++	{ 0x3091, 1, 0, 0x0016 },
++	{ 0x306e, 1, 0, 0x0071 },
++	{ 0x306f, 1, 0, 0x0028 },
++	{ 0x306d, 1, 0, 0x0008 },
++	{ 0x3084, 1, 0, 0x0016 },
++	{ 0x3070, 1, 0, 0x000f },
++	{ 0x306a, 1, 0, 0x0079 },
++	{ 0x30b0, 1, 0, 0x00ff },
++	{ 0x30c2, 1, 0, 0x0005 },
++	{ 0x30c4, 1, 0, 0x0006 },
++	{ 0x3012, 1, 0, 0x004e },
++	{ 0x3080, 1, 0, 0x0008 },
++	{ 0x3083, 1, 0, 0x0014 },
++	{ 0x3200, 1, 0, 0x0001 },
++	{ 0x3081, 1, 0, 0x0007 },
++	{ 0x307b, 1, 0, 0x0085 },
++	{ 0x307a, 1, 0, 0x000a },
++	{ 0x3079, 1, 0, 0x000a },
++	{ 0x308a, 1, 0, 0x0020 },
++	{ 0x308b, 1, 0, 0x0008 },
++	{ 0x308c, 1, 0, 0x000b },
++	{ 0x392f, 1, 0, 0x0001 },
++	{ 0x3930, 1, 0, 0x0000 },
++	{ 0x3924, 1, 0, 0x007f },
++	{ 0x3925, 1, 0, 0x00fd },
++	{ 0x3c08, 1, 0, 0x00ff },
++	{ 0x3c09, 1, 0, 0x00ff },
++	{ 0x3c31, 1, 0, 0x00ff },
++	{ 0x3c32, 1, 0, 0x00ff },
++};
++
++static const struct cam_reg cam_5e9_1280x720_30fps[] = {
++	{ 0x0136, 1, 0, 0x001a },
++	{ 0x0137, 1, 0, 0x0000 },
++	{ 0x0301, 1, 0, 0x0006 },
++	{ 0x0305, 1, 0, 0x0005 },
++	{ 0x0306, 1, 0, 0x0000 },
++	{ 0x0307, 1, 0, 0x006d },
++	{ 0x3c1f, 1, 0, 0x0000 },
++	{ 0x030d, 1, 0, 0x0005 },
++	{ 0x030e, 1, 0, 0x0000 },
++	{ 0x030f, 1, 0, 0x00b4 },
++	{ 0x3c17, 1, 0, 0x0000 },
++	{ 0x0340, 1, 0, 0x0007 },
++	{ 0x0341, 1, 0, 0x00ee },
++	{ 0x0342, 1, 0, 0x000c },
++	{ 0x0343, 1, 0, 0x0028 },
++	{ 0x0344, 1, 0, 0x0000 },
++	{ 0x0345, 1, 0, 0x0018 },
++	{ 0x0346, 1, 0, 0x0001 },
++	{ 0x0347, 1, 0, 0x0004 },
++	{ 0x0348, 1, 0, 0x000a },
++	{ 0x0349, 1, 0, 0x0017 },
++	{ 0x034a, 1, 0, 0x0006 },
++	{ 0x034b, 1, 0, 0x00a3 },
++	{ 0x034c, 1, 0, 0x0005 },
++	{ 0x034d, 1, 0, 0x0000 },
++	{ 0x034e, 1, 0, 0x0002 },
++	{ 0x034f, 1, 0, 0x00d0 },
++	{ 0x0381, 1, 0, 0x0001 },
++	{ 0x0383, 1, 0, 0x0001 },
++	{ 0x0385, 1, 0, 0x0001 },
++	{ 0x0387, 1, 0, 0x0003 },
++	{ 0x0900, 1, 0, 0x0001 },
++	{ 0x0901, 1, 0, 0x0022 },
++	{ 0x0204, 1, 0, 0x0000 },
++	{ 0x0205, 1, 0, 0x0020 },
++	{ 0x0200, 1, 0, 0x000b },
++	{ 0x0201, 1, 0, 0x009c },
++	{ 0x0202, 1, 0, 0x0000 },
++	{ 0x0203, 1, 0, 0x0002 },
++	{ 0x0820, 1, 0, 0x0003 },
++	{ 0x0821, 1, 0, 0x00a8 },
++	{ 0x0822, 1, 0, 0x0000 },
++	{ 0x0823, 1, 0, 0x0000 },
++	{ 0x0112, 1, 0, 0x000a },
++	{ 0x0113, 1, 0, 0x000a },
++	{ 0x0114, 1, 0, 0x0001 },
++	{ 0x3929, 1, 0, 0x000f },
++	{ 0x0101, 1, 0, 0x0000 },
++	{ 0x30b8, 1, 0, 0x002a },
++	{ 0x30ba, 1, 0, 0x002e },
++	{ 0x3941, 1, 0, 0x000f },
++	{ 0x3942, 1, 0, 0x003d },
++	{ 0x3400, 1, 0, 0x0001 },
++	{ 0x3c0f, 1, 0, 0x0001 },
++};
++
++static const struct cam_reg cam_5e9_2576x1932_30fps[] = {
++	{ 0x0136, 1, 0, 0x001a },
++	{ 0x0137, 1, 0, 0x0000 },
++	{ 0x0301, 1, 0, 0x0006 },
++	{ 0x0305, 1, 0, 0x0005 },
++	{ 0x0306, 1, 0, 0x0000 },
++	{ 0x0307, 1, 0, 0x006d },
++	{ 0x3c1f, 1, 0, 0x0000 },
++	{ 0x030d, 1, 0, 0x0005 },
++	{ 0x030e, 1, 0, 0x0000 },
++	{ 0x030f, 1, 0, 0x00b4 },
++	{ 0x3c17, 1, 0, 0x0000 },
++	{ 0x0340, 1, 0, 0x0007 },
++	{ 0x0341, 1, 0, 0x00ee },
++	{ 0x0342, 1, 0, 0x000c },
++	{ 0x0343, 1, 0, 0x0028 },
++	{ 0x0344, 1, 0, 0x0000 },
++	{ 0x0345, 1, 0, 0x0010 },
++	{ 0x0346, 1, 0, 0x0000 },
++	{ 0x0347, 1, 0, 0x000e },
++	{ 0x0348, 1, 0, 0x000a },
++	{ 0x0349, 1, 0, 0x001f },
++	{ 0x034a, 1, 0, 0x0007 },
++	{ 0x034b, 1, 0, 0x0099 },
++	{ 0x034c, 1, 0, 0x000a },
++	{ 0x034d, 1, 0, 0x0010 },
++	{ 0x034e, 1, 0, 0x0007 },
++	{ 0x034f, 1, 0, 0x008c },
++	{ 0x0381, 1, 0, 0x0001 },
++	{ 0x0383, 1, 0, 0x0001 },
++	{ 0x0385, 1, 0, 0x0001 },
++	{ 0x0387, 1, 0, 0x0001 },
++	{ 0x0900, 1, 0, 0x0000 },
++	{ 0x0901, 1, 0, 0x0000 },
++	{ 0x0204, 1, 0, 0x0000 },
++	{ 0x0205, 1, 0, 0x0020 },
++	{ 0x0200, 1, 0, 0x000b },
++	{ 0x0201, 1, 0, 0x009c },
++	{ 0x0202, 1, 0, 0x0000 },
++	{ 0x0203, 1, 0, 0x0002 },
++	{ 0x0820, 1, 0, 0x0003 },
++	{ 0x0821, 1, 0, 0x00a8 },
++	{ 0x0822, 1, 0, 0x0000 },
++	{ 0x0823, 1, 0, 0x0000 },
++	{ 0x0112, 1, 0, 0x000a },
++	{ 0x0113, 1, 0, 0x000a },
++	{ 0x0114, 1, 0, 0x0001 },
++	{ 0x3929, 1, 0, 0x000f },
++	{ 0x0101, 1, 0, 0x0000 },
++	{ 0x30b8, 1, 0, 0x002a },
++	{ 0x30ba, 1, 0, 0x002e },
++	{ 0x3941, 1, 0, 0x000f },
++	{ 0x3942, 1, 0, 0x003d },
++	{ 0x3400, 1, 0, 0x0001 },
++	{ 0x3c0f, 1, 0, 0x0001 },
++};
++
++#endif

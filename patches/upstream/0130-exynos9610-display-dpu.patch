@@ -1,0 +1,2012 @@
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -309,6 +309,7 @@
+ source "drivers/gpu/drm/bridge/Kconfig"
+ source "drivers/gpu/drm/etnaviv/Kconfig"
+ source "drivers/gpu/drm/exynos/Kconfig"
++source "drivers/gpu/drm/exynos9610/Kconfig"
+ source "drivers/gpu/drm/fsl-dcu/Kconfig"
+ source "drivers/gpu/drm/gma500/Kconfig"
+ source "drivers/gpu/drm/gud/Kconfig"
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -188,6 +188,7 @@
+ obj-$(CONFIG_DRM_NOUVEAU) +=nouveau/
+ # nova-drm is built from drivers/gpu/Makefile together with nova-core.
+ obj-$(CONFIG_DRM_EXYNOS) +=exynos/
++obj-$(CONFIG_DRM_EXYNOS9610) += exynos9610/
+ obj-$(CONFIG_DRM_ROCKCHIP) +=rockchip/
+ obj-$(CONFIG_DRM_GMA500) += gma500/
+ obj-$(CONFIG_DRM_UDL) += udl/
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -55,6 +55,59 @@
+ 	};
+ };
+ 
++/ {
++	/*
++	 * Exynos 9610 display subsystem: DECON0 with window 0 fed by DPP G0
++	 * (IDMA at 0x14881000, DPP at 0x14891000), DSIM0 and the 1200x2000
++	 * HX83102E AMOLED panel. The bootloader normally leaves this pipeline
++	 * running; the driver takes it over unless full_init is requested.
++	 */
++	pd_dispaud: power-domain@11864000 {
++		compatible = "samsung,exynos9610-pd";
++		reg = <0 0x11864000 0x20>;
++		#power-domain-cells = <0>;
++		label = "pd-dispaud";
++		samsung,always-on;
++	};
++
++	display: display@148b0000 {
++		compatible = "samsung,exynos9610-dpu";
++		reg = <0 0x148b0000 0x10000>,
++		      <0 0x14881000 0x1000>,
++		      <0 0x14891000 0x1000>,
++		      <0 0x14880000 0x110>,
++		      <0 0x148e0000 0x1000>,
++		      <0 0x14810000 0x10>;
++		reg-names = "decon", "idma", "dpp", "dma-common", "dsim",
++			    "sysreg";
++		interrupts = <GIC_SPI 199 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "decon", "dsim";
++		power-domains = <&pd_dispaud>;
++		dma-coherent;
++		/* Reuse the bootloader splash framebuffer for scanout. */
++		samsung,scanout = <0xca000000 0x00960000>;
++		samsung,pmu-syscon = <&pmu>;
++		reset-gpios = <&gpg1 3 GPIO_ACTIVE_HIGH>;
++		ldo-en-gpios = <&gpg2 4 GPIO_ACTIVE_HIGH>;
++		buck-en-gpios = <&gpg1 2 GPIO_ACTIVE_HIGH>;
++
++		panel-timing {
++			clock-frequency = <171708000>;
++			hactive = <1200>;
++			hfront-porch = <10>;
++			hsync-len = <10>;
++			hback-porch = <10>;
++			vactive = <2000>;
++			vfront-porch = <60>;
++			vsync-len = <4>;
++			vback-porch = <18>;
++			hsync-active = <0>;
++			vsync-active = <0>;
++		};
++	};
++};
++
+ &soc {
+ 	cmu_peri: clock-controller@10030000 {
+ 		compatible = "samsung,exynos9610-cmu-peri";
+--- /dev/null
++++ b/drivers/gpu/drm/exynos9610/Kconfig
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config DRM_EXYNOS9610
++	tristate "Exynos 9610 DECON/DSIM display controller"
++	depends on DRM && OF && ARCH_EXYNOS
++	depends on COMMON_CLK
++	select DRM_KMS_HELPER
++	select DRM_GEM_SHMEM_HELPER
++	select BACKLIGHT_CLASS_DEVICE
++	help
++	  DRM/KMS driver for the Exynos 9610 display subsystem as found in
++	  the Samsung Galaxy Tab S6 Lite (SM-P615). It drives DECON0 with a
++	  DPP-fed window, DSIM0 and the HX83102E AMOLED panel.
++
++	  To compile this driver as a module, choose M here.
+--- /dev/null
++++ b/drivers/gpu/drm/exynos9610/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_DRM_EXYNOS9610) += exynos9610-dpu.o
++exynos9610-dpu-y := exynos9610_drm.o exynos9610_dsi.o
+--- /dev/null
++++ b/drivers/gpu/drm/exynos9610/exynos9610_drm.h
+@@ -0,0 +1,159 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Exynos 9610 (gta4xl) DECON + DSIM + HX83102E AMOLED display driver.
++ *
++ * The register-level sequences are derived from Samsung's downstream
++ * "dpu20" driver for the SM-P615 kernel (GPL-2.0).
++ */
++
++#ifndef __EXYNOS9610_DRM_H__
++#define __EXYNOS9610_DRM_H__
++
++#include <linux/io.h>
++#include <linux/gpio/consumer.h>
++#include <linux/regmap.h>
++
++#include <drm/drm_connector.h>
++#include <drm/drm_device.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_simple_kms_helper.h>
++
++struct exynos9610_drm;
++
++/* DECON register offsets (relative to the DECON block). */
++#define DECON_GLOBAL_CONTROL		0x0000
++#define DECON_GLOBAL_CONTROL_SRESET	BIT(28)
++#define DECON_GLOBAL_CONTROL_OP_CMD	BIT(8)
++#define DECON_GLOBAL_CONTROL_RUN	BIT(4)
++#define DECON_GLOBAL_CONTROL_DECON_EN	BIT(1)
++#define DECON_GLOBAL_CONTROL_EN_F	BIT(0)
++
++#define DECON_SRAM_SHARE_ENABLE		0x0030
++#define DECON_SRAM0_SHARE		BIT(12)
++#define DECON_SRAM1_SHARE		BIT(16)
++
++#define DECON_INTERRUPT_ENABLE		0x0040
++#define DECON_INT_FRAME_START		BIT(12)
++#define DECON_INT_FRAME_DONE		BIT(13)
++#define DECON_INT_EXTRA			BIT(4)
++#define DECON_INT_EN			BIT(0)
++
++#define DECON_INTERRUPT_PENDING		0x004c
++#define DECON_EXTRA_INT_ENABLE		0x0044
++#define DECON_EXTRA_INT_PENDING		0x0050
++
++#define DECON_SHADOW_UPDATE_REQ		0x0060
++#define DECON_SHADOW_UPDATE_GLOBAL	BIT(31)
++
++#define DECON_HW_SW_TRIG_CONTROL	0x0070
++
++#define DECON_SCALED_SIZE_0		0x00a0
++#define DECON_OUTFIFO_SIZE_0		0x0120
++#define DECON_OUTFIFO_TH_0		0x012c
++#define DECON_BLENDER_BG_SIZE_0		0x0200
++#define DECON_BLENDER_BG_COLOR_0	0x0208
++#define DECON_BLENDER_BG_COLOR_1	0x020c
++#define DECON_DATA_PATH_CONTROL_0	0x0214
++#define DECON_DATA_PATH_CONTROL_1	0x0218
++#define DECON_DSIM_CONNECTION_CONTROL	0x0250
++#define DECON_DATA_PATH_CONTROL_2	0x0230
++#define DECON_OUTFIFO_DATA_ORDER	0x0130
++#define DECON_CLOCK_CONTROL_0		0x00f0
++
++#define DECON_WIN_CONTROL_0(_w)		(0x1000 + ((_w) * 0x30))
++#define DECON_WIN_CONTROL_1(_w)		(DECON_WIN_CONTROL_0(_w) + 0x04)
++#define DECON_WIN_START_POS(_w)		(DECON_WIN_CONTROL_0(_w) + 0x08)
++#define DECON_WIN_END_POS(_w)		(DECON_WIN_CONTROL_0(_w) + 0x0c)
++#define DECON_WIN_START_TIME(_w)	(DECON_WIN_CONTROL_0(_w) + 0x18)
++
++#define DECON_WIN_EN(_w)		BIT(4 * (_w))
++#define DECON_WIN_CHMAP(_w, _ch)	(((_ch) & 0x7) << (4 * (_w)))
++/* PD_FUNC_COPY (1) + ALPHA_MULT_SRC_SEL_AF (2), as used by the bootloader. */
++#define DECON_WIN_COPY			(BIT(8) | 2)
++
++#define DECON_OUTFIFO_TH_1H		0x5
++
++/* DPP / IDMA offsets. idma and dpp are separate 4 KiB register windows. */
++#define IDMA_ENABLE			0x0000
++#define IDMA_IRQ			0x0004
++#define IDMA_IN_CON			0x0008
++#define IDMA_OUT_CON			0x000c
++#define IDMA_SRC_SIZE			0x0010
++#define IDMA_SRC_OFFSET			0x0014
++#define IDMA_IMG_SIZE			0x0018
++#define IDMA_IN_BASE_ADDR_Y		0x0040
++#define IDMA_IN_BASE_ADDR_C		0x0044
++
++#define IDMA_IMG_FORMAT_MASK		(0x3f << 11)
++#define IDMA_IMG_FORMAT_ARGB8888	(0 << 11)
++#define IDMA_ROTATION_MASK		(0x7 << 8)
++#define IDMA_AFBC_EN			BIT(7)
++#define IDMA_BLOCK_EN			BIT(3)
++#define IDMA_OUT_FRAME_ALPHA		0xff
++#define IDMA_OUT_FRAME_ALPHA_MASK	(0xff << 24)
++
++#define DPP_ENABLE			0x0000
++#define DPP_IRQ				0x0004
++#define DPP_IN_CON			0x0008
++#define DPP_IMG_SIZE			0x0018
++
++#define DPP_IMG_FORMAT_MASK		0x7
++#define DPP_IMG_FORMAT_ARGB8888		0
++#define DPP_ALPHA_SEL_MASK		BIT(3)
++#define DPP_ALPHA_SEL_PER_PIXEL		BIT(3)
++#define DPP_ALPHA_SEL_PER_FRAME		0
++
++/* DPP channel used by DECON window 0 on Exynos 9610 (IDMA_G0 -> channel 2). */
++#define DECON_WIN0_DPP_CHANNEL		2
++
++struct exynos9610_drm {
++	struct drm_device drm;
++	struct drm_simple_display_pipe pipe;
++	struct drm_connector connector;
++	struct drm_display_mode mode;
++
++	void __iomem *decon;
++	void __iomem *idma;
++	void __iomem *dpp;
++	void __iomem *dma_com;
++	void __iomem *dsim;
++	void __iomem *sysreg;
++
++	struct regmap *pmu;
++	int decon_irq;
++	int dsim_irq;
++
++	struct gpio_desc *ldo_en;
++	struct gpio_desc *buck_en;
++	struct gpio_desc *panel_reset;
++
++	void __iomem *scanout;
++	phys_addr_t scanout_phys;
++	size_t scanout_size;
++
++	struct backlight_device *backlight;
++
++	bool panel_on;
++	bool vblank_enabled;
++	bool vblank_ready;
++	spinlock_t irq_lock;
++};
++
++int exynos9610_dsi_init(struct exynos9610_drm *priv,
++			const struct drm_display_mode *mode);
++void exynos9610_dsi_start(struct exynos9610_drm *priv);
++void exynos9610_dsi_stop(struct exynos9610_drm *priv);
++int exynos9610_dsi_dcs_write(struct exynos9610_drm *priv, const u8 *data,
++			     size_t len);
++
++int exynos9610_panel_power_on(struct exynos9610_drm *priv);
++void exynos9610_panel_power_off(struct exynos9610_drm *priv);
++void exynos9610_panel_reset(struct exynos9610_drm *priv);
++int exynos9610_panel_init(struct exynos9610_drm *priv);
++int exynos9610_panel_display_on(struct exynos9610_drm *priv);
++void exynos9610_panel_suspend(struct exynos9610_drm *priv);
++int exynos9610_panel_set_brightness(struct exynos9610_drm *priv, int level);
++
++extern int exynos9610_brightness;
++
++#endif /* __EXYNOS9610_DRM_H__ */
+--- /dev/null
++++ b/drivers/gpu/drm/exynos9610/exynos9610_drm.c
+@@ -0,0 +1,759 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos 9610 (gta4xl) DECON + DPP + DSIM DRM/KMS driver.
++ *
++ * This driver exposes the single display pipeline used by the Galaxy Tab S6
++ * Lite (SM-P615): DECON0 with window 0 fed by DPP G0, and DSIM0 connected to
++ * the 1200x2000 HX83102E AMOLED panel.
++ *
++ * The bootloader leaves this pipeline running with a splash framebuffer, so
++ * the default "takeover" mode keeps the DSIM/panel state set up by firmware
++ * and only takes ownership of the DECON scanout path. Passing full_init=1
++ * additionally powers the panel, programs DSIM video timing and replays the
++ * vendor init sequence.
++ */
++
++#include <linux/backlight.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_print.h>
++#include <drm/drm_gem_shmem_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_vblank.h>
++
++#include "exynos9610_drm.h"
++
++static bool takeover = true;
++module_param(takeover, bool, 0444);
++MODULE_PARM_DESC(takeover,
++		 "Keep the bootloader-initialized DSIM/panel state (default)");
++
++static bool full_init;
++module_param(full_init, bool, 0444);
++MODULE_PARM_DESC(full_init,
++		 "Power-cycle the panel and replay DSIM/panel initialization");
++
++static bool panel_reinit = true;
++module_param(panel_reinit, bool, 0444);
++MODULE_PARM_DESC(panel_reinit,
++		 "Replay the panel power/reset/init sequence but keep firmware DSIM state");
++
++static bool enable_backlight = true;
++module_param(enable_backlight, bool, 0444);
++MODULE_PARM_DESC(enable_backlight, "Register a backlight for the panel");
++
++int exynos9610_brightness = 128;
++module_param_named(brightness, exynos9610_brightness, int, 0644);
++MODULE_PARM_DESC(brightness, "Default panel brightness (0-306)");
++
++static inline struct exynos9610_drm *pipe_to_priv(struct drm_simple_display_pipe *pipe)
++{
++	return container_of(pipe, struct exynos9610_drm, pipe);
++}
++
++static inline void decon_writel(struct exynos9610_drm *priv, u32 reg, u32 val)
++{
++	writel(val, priv->decon + reg);
++}
++
++static inline u32 decon_readl(struct exynos9610_drm *priv, u32 reg)
++{
++	return readl(priv->decon + reg);
++}
++
++static inline void idma_writel(struct exynos9610_drm *priv, u32 reg, u32 val)
++{
++	writel(val, priv->idma + reg);
++}
++
++static inline void dpp_writel(struct exynos9610_drm *priv, u32 reg, u32 val)
++{
++	writel(val, priv->dpp + reg);
++}
++
++static inline void idma_update(struct exynos9610_drm *priv, u32 reg, u32 val,
++			       u32 mask)
++{
++	u32 old = readl(priv->idma + reg);
++
++	writel((old & ~mask) | (val & mask), priv->idma + reg);
++}
++
++static inline void decon_update(struct exynos9610_drm *priv, u32 reg, u32 val,
++				u32 mask)
++{
++	u32 old = decon_readl(priv, reg);
++
++	decon_writel(priv, reg, (old & ~mask) | (val & mask));
++}
++
++static int exynos9610_wait_shadow_done(struct exynos9610_drm *priv)
++{
++	unsigned int i;
++
++	for (i = 0; i < 2000; i++) {
++		if (!(decon_readl(priv, DECON_SHADOW_UPDATE_REQ) &
++		      DECON_SHADOW_UPDATE_GLOBAL))
++			return 0;
++		usleep_range(50, 100);
++	}
++
++	dev_err(priv->drm.dev, "DECON shadow update timed out\n");
++	return -ETIMEDOUT;
++}
++
++static void exynos9610_decon_commit(struct exynos9610_drm *priv)
++{
++	decon_writel(priv, DECON_SHADOW_UPDATE_REQ, DECON_SHADOW_UPDATE_GLOBAL);
++	exynos9610_wait_shadow_done(priv);
++}
++
++/*
++ * Configure DECON for a video-mode DSI output. Exynos 9610's DECON does not
++ * carry pixel timing registers: DSIM generates the video timing, while DECON
++ * only needs the resolution and the data path/window setup.
++ */
++static void exynos9610_decon_configure(struct exynos9610_drm *priv,
++				       const struct drm_display_mode *mode)
++{
++	u32 w = mode->hdisplay;
++	u32 h = mode->vdisplay;
++	u32 size = (h << 16) | w;
++
++	decon_update(priv, DECON_GLOBAL_CONTROL, 0,
++		     DECON_GLOBAL_CONTROL_OP_CMD);
++	decon_writel(priv, DECON_SRAM_SHARE_ENABLE,
++		     DECON_SRAM0_SHARE | DECON_SRAM1_SHARE);
++	decon_writel(priv, DECON_SCALED_SIZE_0, size);
++	decon_writel(priv, DECON_BLENDER_BG_SIZE_0, size);
++	decon_writel(priv, DECON_BLENDER_BG_COLOR_0, 0);
++	decon_writel(priv, DECON_BLENDER_BG_COLOR_1, 0);
++	decon_writel(priv, DECON_OUTFIFO_SIZE_0, size);
++	decon_writel(priv, DECON_OUTFIFO_TH_0, DECON_OUTFIFO_TH_1H);
++	decon_writel(priv, DECON_CLOCK_CONTROL_0, 0);
++	/* No DSC through OUTFIFO0 to DSIMIF0. */
++	decon_writel(priv, DECON_DATA_PATH_CONTROL_2, 0x1);
++	/* DSIM output uses BGR pixel order for RGB888 panels. */
++	decon_writel(priv, DECON_OUTFIFO_DATA_ORDER, 0x40);
++
++	/* DECON0 -> DSIMIF0 -> DSIM0, no DSC, no dual-DSI splitter. */
++	decon_update(priv, DECON_DSIM_CONNECTION_CONTROL, 0, 0x7);
++
++	/* Window 0 comes from DPP channel 2 (G0). */
++	decon_update(priv, DECON_DATA_PATH_CONTROL_1,
++		     DECON_WIN_CHMAP(0, DECON_WIN0_DPP_CHANNEL),
++		     DECON_WIN_CHMAP(0, 0x7));
++	decon_writel(priv, DECON_WIN_CONTROL_0(0), DECON_WIN_COPY);
++	decon_writel(priv, DECON_WIN_CONTROL_1(0), 0);
++	decon_writel(priv, DECON_WIN_START_POS(0), 0);
++	decon_writel(priv, DECON_WIN_END_POS(0),
++		     ((h - 1) << 16) | (w - 1));
++	decon_writel(priv, DECON_WIN_START_TIME(0), 0);
++}
++
++static void exynos9610_dpp_configure(struct exynos9610_drm *priv,
++				     const struct drm_display_mode *mode,
++				     dma_addr_t addr)
++{
++	u32 w = mode->hdisplay;
++	u32 h = mode->vdisplay;
++
++	idma_writel(priv, IDMA_IN_CON, IDMA_IMG_FORMAT_ARGB8888);
++	idma_writel(priv, IDMA_SRC_OFFSET, 0);
++	idma_writel(priv, IDMA_SRC_SIZE, (h << 16) | w);
++	idma_writel(priv, IDMA_IMG_SIZE, (h << 16) | w);
++	idma_writel(priv, IDMA_IN_BASE_ADDR_Y, lower_32_bits(addr));
++	idma_writel(priv, IDMA_IN_BASE_ADDR_C, 0);
++	idma_update(priv, IDMA_OUT_CON,
++		    IDMA_OUT_FRAME_ALPHA << 24,
++		    IDMA_OUT_FRAME_ALPHA_MASK);
++
++	dpp_writel(priv, DPP_IN_CON, DPP_IMG_FORMAT_ARGB8888 |
++		   DPP_ALPHA_SEL_PER_FRAME);
++	dpp_writel(priv, DPP_IMG_SIZE, (h << 16) | w);
++}
++
++static void exynos9610_plane_commit(struct exynos9610_drm *priv,
++				    struct drm_plane_state *state)
++{
++	struct drm_framebuffer *fb = state->fb;
++	struct iosys_map map;
++	void *vaddr;
++	size_t size;
++	int ret;
++
++	if (!fb) {
++		/* Blank the window; DSIM keeps its timing. */
++		decon_update(priv, DECON_DATA_PATH_CONTROL_0, 0, DECON_WIN_EN(0));
++		exynos9610_decon_commit(priv);
++		return;
++	}
++
++	ret = drm_gem_vmap(fb->obj[0], &map);
++	if (ret) {
++		dev_err(priv->drm.dev, "failed to map framebuffer: %d\n", ret);
++		return;
++	}
++	vaddr = map.vaddr;
++
++	size = min_t(size_t, priv->scanout_size,
++		     (size_t)fb->pitches[0] * fb->height);
++	memcpy_toio(priv->scanout, vaddr + fb->offsets[0], size);
++	drm_gem_vunmap(fb->obj[0], &map);
++	wmb();
++
++	exynos9610_dpp_configure(priv, &priv->mode, priv->scanout_phys);
++
++	decon_update(priv, DECON_DATA_PATH_CONTROL_0, DECON_WIN_EN(0),
++		     DECON_WIN_EN(0));
++	exynos9610_decon_commit(priv);
++}
++
++static int exynos9610_pipe_check(struct drm_simple_display_pipe *pipe,
++				 struct drm_plane_state *plane_state,
++				 struct drm_crtc_state *crtc_state)
++{
++	struct drm_framebuffer *fb = plane_state->fb;
++
++	if (!fb)
++		return 0;
++
++	if (fb->pitches[0] != fb->width * 4) {
++		DRM_DEBUG_KMS("unsupported stride %u for %ux%u\n",
++			      fb->pitches[0], fb->width, fb->height);
++		return -EINVAL;
++	}
++
++	if (fb->width != crtc_state->mode.hdisplay ||
++	    fb->height != crtc_state->mode.vdisplay) {
++		DRM_DEBUG_KMS("only full-screen scanout is supported\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void exynos9610_pipe_enable(struct drm_simple_display_pipe *pipe,
++				   struct drm_crtc_state *crtc_state,
++				   struct drm_plane_state *plane_state)
++{
++	struct exynos9610_drm *priv = pipe_to_priv(pipe);
++	int ret;
++
++	drm_mode_copy(&priv->mode, &crtc_state->mode);
++
++	if (panel_reinit && !full_init) {
++		ret = exynos9610_panel_power_on(priv);
++		if (ret)
++			dev_err(priv->drm.dev, "panel power-on failed: %d\n", ret);
++
++		exynos9610_panel_reset(priv);
++		ret = exynos9610_panel_init(priv);
++		if (ret)
++			dev_err(priv->drm.dev, "panel init failed: %d\n", ret);
++		ret = exynos9610_panel_display_on(priv);
++		if (ret)
++			dev_err(priv->drm.dev, "panel display-on failed: %d\n",
++				ret);
++		priv->panel_on = true;
++	}
++
++	if (full_init && !takeover) {
++		ret = exynos9610_panel_power_on(priv);
++		if (ret) {
++			dev_err(priv->drm.dev, "panel power-on failed: %d\n", ret);
++			return;
++		}
++
++		ret = exynos9610_dsi_init(priv, &priv->mode);
++		if (ret) {
++			dev_err(priv->drm.dev, "DSIM init failed: %d\n", ret);
++			return;
++		}
++
++		exynos9610_panel_reset(priv);
++		exynos9610_dsi_start(priv);
++
++		ret = exynos9610_panel_init(priv);
++		if (ret)
++			dev_err(priv->drm.dev, "panel init failed: %d\n", ret);
++
++		ret = exynos9610_panel_display_on(priv);
++		if (ret)
++			dev_err(priv->drm.dev, "panel display-on failed: %d\n",
++				ret);
++
++		priv->panel_on = true;
++	}
++
++	exynos9610_decon_configure(priv, &priv->mode);
++
++	/* Enable the DECON and wait for the pipeline to report running. */
++	decon_update(priv, DECON_GLOBAL_CONTROL,
++		     DECON_GLOBAL_CONTROL_DECON_EN |
++		     DECON_GLOBAL_CONTROL_EN_F,
++		     DECON_GLOBAL_CONTROL_DECON_EN |
++		     DECON_GLOBAL_CONTROL_EN_F);
++
++	decon_writel(priv, DECON_INTERRUPT_PENDING,
++		     DECON_INT_FRAME_START | DECON_INT_FRAME_DONE);
++	decon_update(priv, DECON_INTERRUPT_ENABLE,
++		     DECON_INT_EN | DECON_INT_FRAME_START |
++		     DECON_INT_FRAME_DONE | DECON_INT_EXTRA,
++		     DECON_INT_EN | DECON_INT_FRAME_START |
++		     DECON_INT_FRAME_DONE | DECON_INT_EXTRA);
++
++	exynos9610_decon_commit(priv);
++
++	exynos9610_plane_commit(priv, plane_state);
++
++	drm_crtc_vblank_on(&pipe->crtc);
++}
++
++static void exynos9610_pipe_disable(struct drm_simple_display_pipe *pipe)
++{
++	struct exynos9610_drm *priv = pipe_to_priv(pipe);
++
++	drm_crtc_vblank_off(&pipe->crtc);
++	decon_update(priv, DECON_DATA_PATH_CONTROL_0, 0, DECON_WIN_EN(0));
++	exynos9610_decon_commit(priv);
++}
++
++static void exynos9610_pipe_update(struct drm_simple_display_pipe *pipe,
++				   struct drm_plane_state *old_state)
++{
++	struct exynos9610_drm *priv = pipe_to_priv(pipe);
++
++	if (pipe->plane.state->fb)
++		exynos9610_plane_commit(priv, pipe->plane.state);
++}
++
++static int exynos9610_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
++{
++	struct exynos9610_drm *priv = pipe_to_priv(pipe);
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->irq_lock, flags);
++	decon_writel(priv, DECON_INTERRUPT_PENDING,
++		     DECON_INT_FRAME_START | DECON_INT_FRAME_DONE);
++	decon_update(priv, DECON_INTERRUPT_ENABLE,
++		     DECON_INT_FRAME_START | DECON_INT_FRAME_DONE |
++		     DECON_INT_EN,
++		     DECON_INT_FRAME_START | DECON_INT_FRAME_DONE |
++		     DECON_INT_EN);
++	priv->vblank_enabled = true;
++	spin_unlock_irqrestore(&priv->irq_lock, flags);
++
++	return 0;
++}
++
++static void exynos9610_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
++{
++	struct exynos9610_drm *priv = pipe_to_priv(pipe);
++	unsigned long flags;
++
++	/*
++	 * Keep the frame interrupts enabled. The DECON pending register is
++	 * write-one-to-clear and re-arming it from the vblank put path races
++	 * with the display engine, so this driver gates vblanks in the DRM
++	 * core rather than in hardware.
++	 */
++	spin_lock_irqsave(&priv->irq_lock, flags);
++	priv->vblank_enabled = false;
++	spin_unlock_irqrestore(&priv->irq_lock, flags);
++}
++
++static enum drm_mode_status
++exynos9610_pipe_mode_valid(struct drm_simple_display_pipe *pipe,
++			   const struct drm_display_mode *mode)
++{
++	struct exynos9610_drm *priv = pipe_to_priv(pipe);
++
++	return drm_crtc_helper_mode_valid_fixed(&pipe->crtc, mode,
++						&priv->mode);
++}
++
++static const struct drm_simple_display_pipe_funcs exynos9610_pipe_funcs = {
++	.mode_valid = exynos9610_pipe_mode_valid,
++	.enable = exynos9610_pipe_enable,
++	.disable = exynos9610_pipe_disable,
++	.check = exynos9610_pipe_check,
++	.update = exynos9610_pipe_update,
++	.enable_vblank = exynos9610_pipe_enable_vblank,
++	.disable_vblank = exynos9610_pipe_disable_vblank,
++};
++
++static irqreturn_t exynos9610_decon_irq(int irq, void *data)
++{
++	struct exynos9610_drm *priv = data;
++	u32 pending;
++	bool vblank = false;
++
++	spin_lock(&priv->irq_lock);
++
++	pending = decon_readl(priv, DECON_INTERRUPT_PENDING);
++	if (pending) {
++		decon_writel(priv, DECON_INTERRUPT_PENDING, pending);
++		if (pending & (DECON_INT_FRAME_START |
++			       DECON_INT_FRAME_DONE))
++			vblank = true;
++	}
++
++	pending = decon_readl(priv, DECON_EXTRA_INT_PENDING);
++	if (pending)
++		decon_writel(priv, DECON_EXTRA_INT_PENDING, pending);
++
++	spin_unlock(&priv->irq_lock);
++
++	if (vblank && priv->vblank_ready) {
++		struct drm_crtc *crtc = &priv->pipe.crtc;
++		unsigned long flags;
++
++		drm_crtc_handle_vblank(crtc);
++
++		spin_lock_irqsave(&crtc->dev->event_lock, flags);
++		if (crtc->state->event) {
++			drm_crtc_send_vblank_event(crtc, crtc->state->event);
++			crtc->state->event = NULL;
++		}
++		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int exynos9610_connector_detect(struct drm_connector *connector,
++				       struct drm_modeset_acquire_ctx *ctx,
++				       bool force)
++{
++	return connector_status_connected;
++}
++
++static int exynos9610_connector_get_modes(struct drm_connector *connector)
++{
++	struct exynos9610_drm *priv =
++		container_of(connector, struct exynos9610_drm, connector);
++
++	int count;
++
++	count = drm_connector_helper_get_modes_fixed(connector, &priv->mode);
++	return count;
++}
++
++static const struct drm_connector_helper_funcs exynos9610_connector_helpers = {
++	.detect_ctx = exynos9610_connector_detect,
++	.get_modes = exynos9610_connector_get_modes,
++};
++
++static const struct drm_connector_funcs exynos9610_connector_funcs = {
++	.reset = drm_atomic_helper_connector_reset,
++	.destroy = drm_connector_cleanup,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++};
++
++static const struct drm_mode_config_funcs exynos9610_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++DEFINE_DRM_GEM_FOPS(exynos9610_drm_fops);
++
++static const struct drm_driver exynos9610_drm_driver = {
++	DRM_GEM_SHMEM_DRIVER_OPS,
++	.name = "exynos9610-dpu",
++	.desc = "Exynos 9610 DECON/DSIM display controller",
++	.major = 1,
++	.minor = 0,
++	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
++	.fops = &exynos9610_drm_fops,
++};
++
++static const u32 exynos9610_formats[] = {
++	DRM_FORMAT_XRGB8888,
++};
++
++static struct drm_display_mode exynos9610_default_mode = {
++	.clock = 171708,
++	.hdisplay = 1200,
++	.hsync_start = 1210,
++	.hsync_end = 1220,
++	.htotal = 1230,
++	.vdisplay = 2000,
++	.vsync_start = 2018,
++	.vsync_end = 2022,
++	.vtotal = 2082,
++	.width_mm = 135,
++	.height_mm = 226,
++	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++};
++
++static int exynos9610_parse_mode(struct exynos9610_drm *priv,
++				 struct device_node *np)
++{
++	struct drm_display_mode *mode = &priv->mode;
++	struct device_node *timing;
++	u32 val;
++
++	*mode = exynos9610_default_mode;
++
++	timing = of_get_child_by_name(np, "panel-timing");
++	if (!timing)
++		return 0;
++
++	if (!of_property_read_u32(timing, "clock-frequency", &val))
++		mode->clock = val / 1000;
++	if (!of_property_read_u32(timing, "hactive", &val))
++		mode->hdisplay = val;
++	if (!of_property_read_u32(timing, "hfront-porch", &val))
++		mode->hsync_start = mode->hdisplay + val;
++	if (!of_property_read_u32(timing, "hsync-len", &val))
++		mode->hsync_end = mode->hsync_start + val;
++	if (!of_property_read_u32(timing, "hback-porch", &val))
++		mode->htotal = mode->hsync_end + val;
++	if (!of_property_read_u32(timing, "vactive", &val))
++		mode->vdisplay = val;
++	if (!of_property_read_u32(timing, "vfront-porch", &val))
++		mode->vsync_start = mode->vdisplay + val;
++	if (!of_property_read_u32(timing, "vsync-len", &val))
++		mode->vsync_end = mode->vsync_start + val;
++	if (!of_property_read_u32(timing, "vback-porch", &val))
++		mode->vtotal = mode->vsync_end + val;
++	if (!of_property_read_u32(timing, "hsync-active", &val))
++		mode->flags |= val ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC;
++	if (!of_property_read_u32(timing, "vsync-active", &val))
++		mode->flags |= val ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC;
++
++	of_node_put(timing);
++	return 0;
++}
++
++static int exynos9610_backlight_get(struct backlight_device *bd)
++{
++	return bd->props.brightness;
++}
++
++static int exynos9610_backlight_update(struct backlight_device *bd)
++{
++	struct exynos9610_drm *priv = bl_get_data(bd);
++
++	return exynos9610_panel_set_brightness(priv, bd->props.brightness);
++}
++
++static const struct backlight_ops exynos9610_backlight_ops = {
++	.get_brightness = exynos9610_backlight_get,
++	.update_status = exynos9610_backlight_update,
++};
++
++static int exynos9610_drm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct exynos9610_drm *priv;
++	struct drm_device *drm;
++	struct resource *res;
++	u32 scanout_phys, scanout_size;
++	int ret;
++
++	priv = devm_drm_dev_alloc(dev, &exynos9610_drm_driver,
++				  struct exynos9610_drm, drm);
++	if (IS_ERR(priv))
++		return PTR_ERR(priv);
++	drm = &priv->drm;
++	platform_set_drvdata(pdev, priv);
++	spin_lock_init(&priv->irq_lock);
++
++	priv->decon = devm_platform_ioremap_resource_byname(pdev, "decon");
++	if (IS_ERR(priv->decon))
++		return PTR_ERR(priv->decon);
++
++	priv->idma = devm_platform_ioremap_resource_byname(pdev, "idma");
++	if (IS_ERR(priv->idma))
++		return PTR_ERR(priv->idma);
++
++	priv->dpp = devm_platform_ioremap_resource_byname(pdev, "dpp");
++	if (IS_ERR(priv->dpp))
++		return PTR_ERR(priv->dpp);
++
++	priv->dsim = devm_platform_ioremap_resource_byname(pdev, "dsim");
++	if (IS_ERR(priv->dsim))
++		return PTR_ERR(priv->dsim);
++
++	priv->sysreg = devm_platform_ioremap_resource_byname(pdev, "sysreg");
++	if (IS_ERR(priv->sysreg))
++		return PTR_ERR(priv->sysreg);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dma-common");
++	if (res) {
++		priv->dma_com = devm_ioremap_resource(dev, res);
++		if (IS_ERR(priv->dma_com))
++			return PTR_ERR(priv->dma_com);
++	}
++
++	ret = of_property_read_u32_index(dev->of_node, "samsung,scanout", 0,
++					 &scanout_phys);
++	if (ret) {
++		/* Fall back to the bootloader splash framebuffer. */
++		scanout_phys = 0xca000000;
++		scanout_size = 0x960000;
++	} else {
++		of_property_read_u32_index(dev->of_node, "samsung,scanout", 1,
++					   &scanout_size);
++	}
++	priv->scanout_phys = scanout_phys;
++	priv->scanout_size = scanout_size;
++	priv->scanout = devm_ioremap_wc(dev, scanout_phys, scanout_size);
++	if (!priv->scanout)
++		return -ENOMEM;
++
++	priv->pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
++						   "samsung,pmu-syscon");
++	if (IS_ERR(priv->pmu)) {
++		dev_warn(dev, "no PMU syscon, DSIM PHY isolation is not managed\n");
++		priv->pmu = NULL;
++	}
++
++	priv->ldo_en = devm_gpiod_get_optional(dev, "ldo-en", GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->ldo_en))
++		return dev_err_probe(dev, PTR_ERR(priv->ldo_en),
++				     "failed to get panel LDO enable\n");
++
++	priv->buck_en = devm_gpiod_get_optional(dev, "buck-en", GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->buck_en))
++		return dev_err_probe(dev, PTR_ERR(priv->buck_en),
++				     "failed to get panel buck enable\n");
++
++	priv->panel_reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->panel_reset))
++		return dev_err_probe(dev, PTR_ERR(priv->panel_reset),
++				     "failed to get panel reset\n");
++
++	priv->decon_irq = platform_get_irq(pdev, 0);
++	if (priv->decon_irq < 0)
++		return priv->decon_irq;
++
++	priv->dsim_irq = platform_get_irq(pdev, 1);
++
++	ret = exynos9610_parse_mode(priv, dev->of_node);
++	if (ret)
++		return ret;
++
++	drm->mode_config.min_width = priv->mode.hdisplay;
++	drm->mode_config.max_width = priv->mode.hdisplay;
++	drm->mode_config.min_height = priv->mode.vdisplay;
++	drm->mode_config.max_height = priv->mode.vdisplay;
++	drm->mode_config.preferred_depth = 24;
++	drm->mode_config.funcs = &exynos9610_mode_config_funcs;
++
++	ret = drm_mode_config_init(drm);
++	if (ret)
++		return ret;
++
++	ret = drm_connector_init(drm, &priv->connector,
++				 &exynos9610_connector_funcs,
++				 DRM_MODE_CONNECTOR_DSI);
++	if (ret)
++		return ret;
++	drm_connector_helper_add(&priv->connector,
++				 &exynos9610_connector_helpers);
++	priv->connector.display_info.width_mm = priv->mode.width_mm;
++	priv->connector.display_info.height_mm = priv->mode.height_mm;
++
++	ret = drm_simple_display_pipe_init(drm, &priv->pipe,
++					   &exynos9610_pipe_funcs,
++					   exynos9610_formats,
++					   ARRAY_SIZE(exynos9610_formats),
++					   NULL, &priv->connector);
++	if (ret)
++		return ret;
++
++	drm_mode_config_reset(drm);
++
++	ret = devm_request_irq(dev, priv->decon_irq, exynos9610_decon_irq,
++			       IRQF_SHARED, "exynos9610-decon", priv);
++	if (ret) {
++		dev_warn(dev, "DECON IRQ unavailable (%d), vblank disabled\n",
++			 ret);
++		priv->decon_irq = -1;
++	}
++
++	ret = drm_vblank_init(drm, drm->mode_config.num_crtc);
++	if (ret)
++		return ret;
++	priv->vblank_ready = true;
++
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		return ret;
++
++	drm_kms_helper_poll_init(drm);
++
++	if (enable_backlight) {
++		struct backlight_properties props = {
++			.type = BACKLIGHT_RAW,
++			.max_brightness = 306,
++			.brightness = clamp(exynos9610_brightness, 0, 306),
++		};
++
++		priv->backlight = devm_backlight_device_register(dev, "panel",
++								 dev, priv,
++								 &exynos9610_backlight_ops,
++								 &props);
++		if (IS_ERR(priv->backlight)) {
++			ret = PTR_ERR(priv->backlight);
++			priv->backlight = NULL;
++			dev_warn(dev, "backlight registration failed: %d\n", ret);
++		}
++	}
++
++	dev_info(dev, "Exynos 9610 display ready: %ux%u%s\n",
++		 priv->mode.hdisplay, priv->mode.vdisplay,
++		 (full_init && !takeover) ? " (full panel init)" :
++		 panel_reinit ? " (panel reinit)" : " (takeover)");
++
++	return 0;
++}
++
++static void exynos9610_drm_remove(struct platform_device *pdev)
++{
++	struct exynos9610_drm *priv = platform_get_drvdata(pdev);
++
++	drm_kms_helper_poll_fini(&priv->drm);
++	drm_atomic_helper_shutdown(&priv->drm);
++	drm_dev_unregister(&priv->drm);
++}
++
++static const struct of_device_id exynos9610_drm_match[] = {
++	{ .compatible = "samsung,exynos9610-dpu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, exynos9610_drm_match);
++
++static struct platform_driver exynos9610_drm_platform_driver = {
++	.probe = exynos9610_drm_probe,
++	.remove = exynos9610_drm_remove,
++	.driver = {
++		.name = "exynos9610-dpu",
++		.of_match_table = exynos9610_drm_match,
++	},
++};
++module_platform_driver(exynos9610_drm_platform_driver);
++
++MODULE_AUTHOR("gta4xl upstream bring-up");
++MODULE_DESCRIPTION("Exynos 9610 DECON/DSIM display driver");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/gpu/drm/exynos9610/exynos9610_dsi.c
+@@ -0,0 +1,591 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos 9610 DSIM0 and HX83102E AMOLED panel support for gta4xl.
++ *
++ * Register sequences and panel init data are ported from Samsung's downstream
++ * dpu20 driver (drivers/video/fbdev/exynos/dpu20) for the SM-P615 kernel.
++ */
++
++#include <linux/backlight.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/gpio/consumer.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++
++#include <video/mipi_display.h>
++
++#include <drm/drm_modes.h>
++
++#include "exynos9610_drm.h"
++#include "hx83102e_seq.h"
++
++/* DSIM register offsets (Exynos 9610 layout). */
++#define DSIM_SWRST			0x0004
++#define DSIM_SWRST_RESET		BIT(0)
++#define DSIM_SWRST_FUNCRST		BIT(8)
++#define DSIM_SWRST_DPHY_RST		BIT(16)
++
++#define DSIM_LINK_STATUS3		0x0014
++#define DSIM_LINK_STATUS3_PLL_STABLE	BIT(0)
++
++#define DSIM_DPHY_STATUS		0x001c
++#define DSIM_DPHY_STATUS_TX_READY_HS_CLK	BIT(10)
++
++#define DSIM_CLK_CTRL			0x0020
++#define DSIM_CLK_CTRL_CLOCK_SEL		BIT(26)
++#define DSIM_CLK_CTRL_CLKLANE_ONOFF	BIT(24)
++#define DSIM_CLK_CTRL_TX_REQUEST_HSCLK	BIT(20)
++#define DSIM_CLK_CTRL_WORDCLK_EN	BIT(17)
++#define DSIM_CLK_CTRL_ESCCLK_EN		BIT(16)
++#define DSIM_CLK_CTRL_LANE_ESCCLK_EN(_v)	(((_v) & 0x1f) << 8)
++#define DSIM_CLK_CTRL_LANE_ESCCLK_MASK	(0x1f << 8)
++#define DSIM_CLK_CTRL_ESC_PRESCALER(_v)	((_v) << 0)
++#define DSIM_CLK_CTRL_ESC_PRESCALER_MASK	(0xff << 0)
++
++#define DSIM_TIMEOUT			0x0028
++#define DSIM_TIMEOUT_BTA(_v)		((_v) << 16)
++#define DSIM_TIMEOUT_LPDR(_v)		((_v) << 0)
++
++#define DSIM_ESCMODE			0x002c
++#define DSIM_ESCMODE_STOP_STATE_CNT(_v)	(((_v) & 0x7ff) << 21)
++
++#define DSIM_NUM_OF_TRANSFER		0x0030
++
++#define DSIM_THRESHOLD			0x0038
++
++#define DSIM_RESOL			0x003c
++#define DSIM_RESOL_VRESOL(_v)		(((_v) & 0x1fff) << 16)
++#define DSIM_RESOL_HRESOL(_v)		(((_v) & 0x1fff) << 0)
++
++#define DSIM_VPORCH			0x0040
++#define DSIM_VPORCH_VFP_CMD_ALLOW(_v)	(((_v) & 0xff) << 24)
++#define DSIM_VPORCH_STABLE_VFP(_v)	(((_v) & 0xff) << 16)
++#define DSIM_VPORCH_VFP(_v)		(((_v) & 0xff) << 8)
++#define DSIM_VPORCH_VBP(_v)		(((_v) & 0xff) << 0)
++
++#define DSIM_HPORCH			0x0044
++#define DSIM_HPORCH_HFP(_v)		(((_v) & 0xffff) << 16)
++#define DSIM_HPORCH_HBP(_v)		(((_v) & 0xffff) << 0)
++
++#define DSIM_SYNC			0x0048
++#define DSIM_SYNC_VSA(_v)		(((_v) & 0xff) << 16)
++#define DSIM_SYNC_HSA(_v)		(((_v) & 0xffff) << 0)
++
++#define DSIM_CONFIG			0x004c
++#define DSIM_CONFIG_SYNC_INFORM		BIT(27)
++#define DSIM_CONFIG_BURST_MODE		BIT(26)
++#define DSIM_CONFIG_HSE_DISABLE		BIT(23)
++#define DSIM_CONFIG_HFP_DISABLE		BIT(22)
++#define DSIM_CONFIG_HBP_DISABLE		BIT(21)
++#define DSIM_CONFIG_HSA_DISABLE		BIT(20)
++#define DSIM_CONFIG_VIDEO_MODE		BIT(18)
++#define DSIM_CONFIG_VC_ID(_v)		(((_v) & 0x3) << 15)
++#define DSIM_CONFIG_PIXEL_FORMAT(_v)	(((_v) & 0x3f) << 9)
++#define DSIM_CONFIG_PER_FRAME_READ	BIT(8)
++#define DSIM_CONFIG_EOTP_EN		BIT(7)
++#define DSIM_CONFIG_NUM_LANES(_v)	(((_v) & 0x3) << 5)
++#define DSIM_CONFIG_LANES_EN(_v)	(((_v) & 0x1f) << 0)
++
++#define DSIM_INTSRC			0x0050
++#define DSIM_INTMSK			0x0054
++#define DSIM_INTSRC_PLL_STABLE		BIT(31)
++#define DSIM_INTSRC_SFR_PH_FIFO_EMPTY	BIT(28)
++#define DSIM_INTSRC_FRAME_DONE		BIT(24)
++#define DSIM_INTSRC_UNDER_RUN		BIT(19)
++
++#define DSIM_PKTHDR			0x0058
++#define DSIM_PKTHDR_BTA(_v)		(((_v) & 0x1) << 24)
++#define DSIM_PKTHDR_DATA1(_v)		(((_v) & 0xff) << 16)
++#define DSIM_PKTHDR_DATA0(_v)		(((_v) & 0xff) << 8)
++#define DSIM_PKTHDR_ID(_v)		(((_v) & 0x3f) << 0)
++
++#define DSIM_PAYLOAD			0x005c
++
++#define DSIM_SFR_CTRL			0x0064
++#define DSIM_SFR_CTRL_SHADOW_READ_EN	BIT(1)
++#define DSIM_SFR_CTRL_SHADOW_EN		BIT(0)
++
++#define DSIM_FIFOCTRL			0x0068
++#define DSIM_FIFOCTRL_EMPTY_PH		BIT(10)
++#define DSIM_FIFOCTRL_EMPTY_PL		BIT(8)
++
++#define DSIM_PLLCTRL			0x00a0
++#define DSIM_PLLCTRL_PLL_EN		BIT(23)
++#define DSIM_PLLCTRL_PMS(_p, _m, _s) \
++	((((_p) & 0x3f) << 13) | (((_m) & 0x3ff) << 3) | ((_s) & 0x7))
++#define DSIM_PLL_CTRL1			0x00a4
++#define DSIM_PLL_CTRL2			0x00a8
++#define DSIM_PLLTMR			0x00ac
++
++#define DSIM_PHYCTRL_B1			0x00b0
++#define DSIM_PHYCTRL_B2			0x00b4
++#define DSIM_PHYCTRL_B3			0x00b8
++#define DSIM_PHYCTRL_B4			0x00bc
++#define DSIM_PHYCTRL_M1			0x00c0
++#define DSIM_PHYCTRL_M2			0x00c4
++#define DSIM_PHYCTRL_M3			0x00c8
++#define DSIM_PHYCTRL_M4			0x00cc
++
++#define DSIM_PHY_TIMING			0x00d0
++#define DSIM_PHY_TIMING_LPX(_v)		(((_v) & 0xff) << 8)
++#define DSIM_PHY_TIMING_HSEXIT(_v)	((_v) & 0xff)
++#define DSIM_PHY_TIMING1		0x00d4
++#define DSIM_PHY_TIMING1_CLKPREP(_v)	(((_v) & 0xff) << 24)
++#define DSIM_PHY_TIMING1_CLKZERO(_v)	(((_v) & 0xff) << 16)
++#define DSIM_PHY_TIMING1_CLKPOST(_v)	(((_v) & 0xff) << 8)
++#define DSIM_PHY_TIMING1_CLKTRAIL(_v)	((_v) & 0xff)
++#define DSIM_PHY_TIMING2		0x00d8
++#define DSIM_PHY_TIMING2_HSPREP(_v)	(((_v) & 0xff) << 16)
++#define DSIM_PHY_TIMING2_HSZERO(_v)	(((_v) & 0xff) << 8)
++#define DSIM_PHY_TIMING2_HSTRAIL(_v)	((_v) & 0xff)
++
++/* SYSREG_DISPAUD MIPI PHY control (DISP_DPU_MIPI_PHY_CON). */
++#define SYSREG_MIPI_PHY_CON		0x0008
++#define SYSREG_SEL_RESET_DPHY(_v)	BIT(4 + (_v))
++#define SYSREG_RESETN_M4S4_TOP		BIT(0)
++
++#define DSIM_LANES			4
++#define DSIM_ESC_CLK_MHZ		16
++#define DSIM_HS_CLK_MHZ			1030
++#define DSIM_PMS_P			2
++#define DSIM_PMS_M			317
++#define DSIM_PMS_S			2
++#define DSIM_PLL_TIMER			0x13880
++
++static inline void dsim_writel(struct exynos9610_drm *priv, u32 reg, u32 val)
++{
++	writel(val, priv->dsim + reg);
++}
++
++static inline u32 dsim_readl(struct exynos9610_drm *priv, u32 reg)
++{
++	return readl(priv->dsim + reg);
++}
++
++static inline void dsim_update(struct exynos9610_drm *priv, u32 reg, u32 val,
++			       u32 mask)
++{
++	u32 old = dsim_readl(priv, reg);
++
++	dsim_writel(priv, reg, (old & ~mask) | (val & mask));
++}
++
++static inline void sysreg_update(struct exynos9610_drm *priv, u32 reg, u32 val,
++				 u32 mask)
++{
++	u32 old = readl(priv->sysreg + reg);
++
++	writel((old & ~mask) | (val & mask), priv->sysreg + reg);
++}
++
++static int dsim_wait_pll_stable(struct exynos9610_drm *priv)
++{
++	u32 val;
++
++	return readl_poll_timeout(priv->dsim + DSIM_LINK_STATUS3, val,
++				  val & DSIM_LINK_STATUS3_PLL_STABLE,
++				  10, 10000);
++}
++
++static int dsim_wait_hs_clock(struct exynos9610_drm *priv)
++{
++	u32 val;
++
++	return readl_poll_timeout(priv->dsim + DSIM_DPHY_STATUS, val,
++				  val & DSIM_DPHY_STATUS_TX_READY_HS_CLK,
++				  10, 10000);
++}
++
++static void dsim_sw_reset(struct exynos9610_drm *priv)
++{
++	u32 val;
++
++	dsim_update(priv, DSIM_SWRST, DSIM_SWRST_RESET, DSIM_SWRST_RESET);
++	if (readl_poll_timeout(priv->dsim + DSIM_SWRST, val,
++			       !(val & DSIM_SWRST_RESET), 10, 10000))
++		dev_err(priv->drm.dev, "DSIM software reset timed out\n");
++}
++
++static void dsim_set_pll(struct exynos9610_drm *priv, bool enable)
++{
++	if (enable) {
++		dsim_writel(priv, DSIM_INTSRC, DSIM_INTSRC_PLL_STABLE);
++		dsim_update(priv, DSIM_PLLCTRL, DSIM_PLLCTRL_PLL_EN,
++			    DSIM_PLLCTRL_PLL_EN);
++		if (dsim_wait_pll_stable(priv))
++			dev_err(priv->drm.dev, "DSIM PLL did not lock\n");
++	} else {
++		dsim_update(priv, DSIM_PLLCTRL, 0, DSIM_PLLCTRL_PLL_EN);
++	}
++}
++
++/*
++ * Program the D-PHY timing. The values below are the panel-specific timing
++ * table entries for 1030 Mbps used by the downstream driver.
++ */
++static void dsim_set_dphy_timing(struct exynos9610_drm *priv)
++{
++	/* clk_prepare=10 clk_zero=16 clk_post=7 clk_trail=6
++	 * hs_prepare=9 hs_zero=6 hs_trail=10 lpx=6 hs_exit=6
++	 */
++	dsim_writel(priv, DSIM_PHY_TIMING,
++		    DSIM_PHY_TIMING_LPX(6) | DSIM_PHY_TIMING_HSEXIT(6));
++	dsim_writel(priv, DSIM_PHY_TIMING1,
++		    DSIM_PHY_TIMING1_CLKPREP(10) |
++		    DSIM_PHY_TIMING1_CLKZERO(16) |
++		    DSIM_PHY_TIMING1_CLKPOST(7) |
++		    DSIM_PHY_TIMING1_CLKTRAIL(6));
++	dsim_writel(priv, DSIM_PHY_TIMING2,
++		    DSIM_PHY_TIMING2_HSPREP(9) |
++		    DSIM_PHY_TIMING2_HSZERO(6) |
++		    DSIM_PHY_TIMING2_HSTRAIL(10));
++
++	/* b_dphyctl for a 16 MHz escape clock. */
++	dsim_writel(priv, DSIM_PHYCTRL_B1, 0x190);
++}
++
++static void dsim_set_config(struct exynos9610_drm *priv,
++			    const struct drm_display_mode *mode)
++{
++	u32 hbp = mode->htotal - mode->hsync_end;
++	u32 hfp = mode->hsync_start - mode->hdisplay;
++	u32 hsa = mode->hsync_end - mode->hsync_start;
++	u32 vbp = mode->vtotal - mode->vsync_end;
++	u32 vfp = mode->vsync_start - mode->vdisplay;
++	u32 vsa = mode->vsync_end - mode->vsync_start;
++	u32 num_transfer = mode->hdisplay * mode->vdisplay / mode->hdisplay;
++
++	/* Use raw porch values; this matches the panel's DTS timing. */
++	dsim_writel(priv, DSIM_VPORCH,
++		    DSIM_VPORCH_VFP_CMD_ALLOW(4) |
++		    DSIM_VPORCH_STABLE_VFP(2) |
++		    DSIM_VPORCH_VFP(vfp) | DSIM_VPORCH_VBP(vbp));
++	dsim_writel(priv, DSIM_HPORCH,
++		    DSIM_HPORCH_HFP(hfp) | DSIM_HPORCH_HBP(hbp));
++	dsim_writel(priv, DSIM_SYNC,
++		    DSIM_SYNC_VSA(vsa) | DSIM_SYNC_HSA(hsa));
++
++	dsim_update(priv, DSIM_SFR_CTRL, DSIM_SFR_CTRL_SHADOW_READ_EN,
++		    DSIM_SFR_CTRL_SHADOW_READ_EN);
++	dsim_writel(priv, DSIM_TIMEOUT,
++		    DSIM_TIMEOUT_BTA(0xff) | DSIM_TIMEOUT_LPDR(0xffff));
++	dsim_update(priv, DSIM_ESCMODE,
++		    DSIM_ESCMODE_STOP_STATE_CNT(0xa),
++		    DSIM_ESCMODE_STOP_STATE_CNT(0x7ff));
++	dsim_writel(priv, DSIM_THRESHOLD, mode->hdisplay);
++	dsim_writel(priv, DSIM_RESOL,
++		    DSIM_RESOL_VRESOL(mode->vdisplay) |
++		    DSIM_RESOL_HRESOL(mode->hdisplay));
++	dsim_writel(priv, DSIM_NUM_OF_TRANSFER, num_transfer);
++
++	dsim_update(priv, DSIM_CONFIG, DSIM_CONFIG_NUM_LANES(DSIM_LANES - 1),
++		    DSIM_CONFIG_NUM_LANES(0x3));
++	dsim_update(priv, DSIM_CONFIG,
++		    DSIM_CONFIG_EOTP_EN | DSIM_CONFIG_PIXEL_FORMAT(0x3e) |
++		    DSIM_CONFIG_VC_ID(0),
++		    DSIM_CONFIG_EOTP_EN | DSIM_CONFIG_PIXEL_FORMAT(0x3f) |
++		    DSIM_CONFIG_VC_ID(0x3));
++	dsim_update(priv, DSIM_CONFIG, 0, DSIM_CONFIG_PER_FRAME_READ);
++
++	/* Video mode: no HSA/HBP/HSE suppression, HFP suppressed, burst on. */
++	dsim_update(priv, DSIM_CONFIG, 0,
++		    DSIM_CONFIG_HSA_DISABLE | DSIM_CONFIG_HBP_DISABLE |
++		    DSIM_CONFIG_HSE_DISABLE | DSIM_CONFIG_SYNC_INFORM);
++	dsim_update(priv, DSIM_CONFIG, DSIM_CONFIG_HFP_DISABLE,
++		    DSIM_CONFIG_HFP_DISABLE);
++	dsim_update(priv, DSIM_CONFIG, DSIM_CONFIG_BURST_MODE,
++		    DSIM_CONFIG_BURST_MODE);
++
++	/*
++	 * Enable video mode directly. The downstream driver does this under
++	 * the shadow register, which only works because its DSIM is already
++	 * running video timing. After a panel power cycle there is no frame
++	 * boundary to apply the shadow update, so write it immediately.
++	 */
++	dsim_update(priv, DSIM_CONFIG, DSIM_CONFIG_VIDEO_MODE,
++		    DSIM_CONFIG_VIDEO_MODE);
++	dsim_update(priv, DSIM_CLK_CTRL, DSIM_CLK_CTRL_CLKLANE_ONOFF,
++		    DSIM_CLK_CTRL_CLKLANE_ONOFF);
++
++	/* Two-byte PPI, as used by the downstream DSIM setup. */
++	dsim_update(priv, 0x009c, 0, BIT(9));
++}
++
++static void dsim_enable_lanes(struct exynos9610_drm *priv, bool enable)
++{
++	dsim_update(priv, DSIM_CONFIG,
++		    enable ? DSIM_CONFIG_LANES_EN(0x1f) : 0,
++		    DSIM_CONFIG_LANES_EN(0x1f));
++}
++
++int exynos9610_dsi_init(struct exynos9610_drm *priv,
++			const struct drm_display_mode *mode)
++{
++	u32 esc_div = DSIM_HS_CLK_MHZ / 16 / DSIM_ESC_CLK_MHZ;
++
++	if (priv->pmu) {
++		/* Release the MIPI PHY isolation. */
++		regmap_update_bits(priv->pmu, 0x70c, BIT(0), BIT(0));
++	}
++
++	/* Route D-PHY reset control to DSIM and assert the reset. */
++	sysreg_update(priv, SYSREG_MIPI_PHY_CON, 0,
++		      SYSREG_SEL_RESET_DPHY(0) | SYSREG_RESETN_M4S4_TOP);
++	dsim_update(priv, DSIM_SWRST, 0, DSIM_SWRST_DPHY_RST);
++
++	dsim_sw_reset(priv);
++
++	/* Select OSC clock while configuring the PHY. */
++	dsim_update(priv, DSIM_CLK_CTRL, 0, DSIM_CLK_CTRL_CLOCK_SEL);
++
++	dsim_update(priv, DSIM_CLK_CTRL,
++		    DSIM_CLK_CTRL_ESCCLK_EN |
++		    DSIM_CLK_CTRL_ESC_PRESCALER(esc_div),
++		    DSIM_CLK_CTRL_ESCCLK_EN |
++		    DSIM_CLK_CTRL_ESC_PRESCALER_MASK);
++	dsim_set_dphy_timing(priv);
++
++	dsim_writel(priv, DSIM_PLL_CTRL1, 0);
++	dsim_writel(priv, DSIM_PLL_CTRL2, 0);
++	dsim_writel(priv, DSIM_PHYCTRL_B2, 0x800);
++	dsim_writel(priv, DSIM_PHYCTRL_B3, 0);
++	dsim_writel(priv, DSIM_PHYCTRL_B4, 0x40);
++	dsim_writel(priv, DSIM_PHYCTRL_M1, 0);
++	dsim_writel(priv, DSIM_PHYCTRL_M2, 0);
++	dsim_writel(priv, DSIM_PHYCTRL_M3, 0);
++	dsim_writel(priv, DSIM_PHYCTRL_M4, 0);
++
++	/* Force a fresh lock even if the bootloader left the PLL running. */
++	dsim_set_pll(priv, false);
++	udelay(100);
++	dsim_writel(priv, DSIM_PLLCTRL,
++		    DSIM_PLLCTRL_PMS(DSIM_PMS_P, DSIM_PMS_M, DSIM_PMS_S));
++	dsim_writel(priv, DSIM_PLLTMR, DSIM_PLL_TIMER);
++	dsim_set_pll(priv, true);
++
++	dsim_enable_lanes(priv, true);
++	usleep_range(400, 500);
++
++	/* Release the D-PHY reset and switch to the word clock. */
++	sysreg_update(priv, SYSREG_MIPI_PHY_CON, SYSREG_RESETN_M4S4_TOP,
++		      SYSREG_RESETN_M4S4_TOP);
++	dsim_update(priv, DSIM_CLK_CTRL, DSIM_CLK_CTRL_CLOCK_SEL,
++		    DSIM_CLK_CTRL_CLOCK_SEL);
++	/* Match the bootloader: escape clock on the clock and all data lanes. */
++	dsim_update(priv, DSIM_CLK_CTRL,
++		    DSIM_CLK_CTRL_LANE_ESCCLK_EN(0x1f),
++		    DSIM_CLK_CTRL_LANE_ESCCLK_MASK);
++	dsim_update(priv, DSIM_CLK_CTRL, DSIM_CLK_CTRL_WORDCLK_EN,
++		    DSIM_CLK_CTRL_WORDCLK_EN);
++
++	dsim_set_config(priv, mode);
++
++	return 0;
++}
++
++void exynos9610_dsi_start(struct exynos9610_drm *priv)
++{
++	dsim_update(priv, DSIM_CLK_CTRL, DSIM_CLK_CTRL_TX_REQUEST_HSCLK,
++		    DSIM_CLK_CTRL_TX_REQUEST_HSCLK);
++	if (dsim_wait_hs_clock(priv))
++		dev_warn(priv->drm.dev, "DSIM HS clock not ready\n");
++
++	dsim_writel(priv, DSIM_INTSRC, 0xffffffff);
++	dsim_writel(priv, DSIM_INTMSK, 0xffffffff);
++}
++
++void exynos9610_dsi_stop(struct exynos9610_drm *priv)
++{
++	dsim_update(priv, DSIM_CLK_CTRL, 0, DSIM_CLK_CTRL_TX_REQUEST_HSCLK);
++	dsim_update(priv, DSIM_CLK_CTRL, 0, DSIM_CLK_CTRL_CLOCK_SEL);
++	dsim_enable_lanes(priv, false);
++	dsim_set_pll(priv, false);
++}
++
++int exynos9610_dsi_dcs_write(struct exynos9610_drm *priv, const u8 *data,
++			     size_t len)
++{
++	u32 val;
++	size_t i;
++
++	if (!len)
++		return 0;
++
++	/* Long packet: payload first, then the packet header. */
++	for (i = 0; i < len; i += 4) {
++		u32 payload = data[i];
++
++		if (i + 1 < len)
++			payload |= data[i + 1] << 8;
++		if (i + 2 < len)
++			payload |= data[i + 2] << 16;
++		if (i + 3 < len)
++			payload |= data[i + 3] << 24;
++		dsim_writel(priv, DSIM_PAYLOAD, payload);
++	}
++
++	dsim_writel(priv, DSIM_PKTHDR,
++		    DSIM_PKTHDR_BTA(0) |
++		    DSIM_PKTHDR_DATA1((len >> 8) & 0xff) |
++		    DSIM_PKTHDR_DATA0(len & 0xff) |
++		    DSIM_PKTHDR_ID(MIPI_DSI_DCS_LONG_WRITE));
++
++	if (readl_poll_timeout(priv->dsim + DSIM_FIFOCTRL, val,
++			       val & DSIM_FIFOCTRL_EMPTY_PH, 10, 50000)) {
++		dev_err(priv->drm.dev, "DSIM command FIFO timed out\n");
++		return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++
++static int panel_write(struct exynos9610_drm *priv, const u8 *cmd, size_t len)
++{
++	return exynos9610_dsi_dcs_write(priv, cmd, len);
++}
++
++int exynos9610_panel_power_on(struct exynos9610_drm *priv)
++{
++	if (priv->ldo_en)
++		gpiod_set_value_cansleep(priv->ldo_en, 1);
++	usleep_range(5000, 6000);
++	if (priv->buck_en)
++		gpiod_set_value_cansleep(priv->buck_en, 1);
++	usleep_range(5000, 6000);
++	if (priv->panel_reset)
++		gpiod_set_value_cansleep(priv->panel_reset, 1);
++	usleep_range(5000, 6000);
++
++	return 0;
++}
++
++void exynos9610_panel_power_off(struct exynos9610_drm *priv)
++{
++	msleep(40);
++	if (priv->panel_reset)
++		gpiod_set_value_cansleep(priv->panel_reset, 0);
++	usleep_range(5000, 6000);
++	if (priv->buck_en)
++		gpiod_set_value_cansleep(priv->buck_en, 0);
++	usleep_range(5000, 6000);
++	if (priv->ldo_en)
++		gpiod_set_value_cansleep(priv->ldo_en, 0);
++}
++
++void exynos9610_panel_reset(struct exynos9610_drm *priv)
++{
++	if (!priv->panel_reset)
++		return;
++
++	gpiod_set_value_cansleep(priv->panel_reset, 1);
++	usleep_range(5000, 6000);
++	gpiod_set_value_cansleep(priv->panel_reset, 0);
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(priv->panel_reset, 1);
++	msleep(60);
++}
++
++int exynos9610_panel_init(struct exynos9610_drm *priv)
++{
++	int ret;
++
++	dsim_writel(priv, DSIM_PHYCTRL_M3, 0x50400);
++	usleep_range(1000, 2000);
++
++	/* Enable vendor command access. */
++	ret = panel_write(priv, SEQ_SET_B9_PW, ARRAY_SIZE(SEQ_SET_B9_PW));
++	if (ret)
++		return ret;
++
++	panel_write(priv, SEQ_SET_E9_OTP_SETTING, ARRAY_SIZE(SEQ_SET_E9_OTP_SETTING));
++	panel_write(priv, SEQ_SET_BB_OTP_SETTING, ARRAY_SIZE(SEQ_SET_BB_OTP_SETTING));
++	panel_write(priv, SEQ_SET_E9_OTP_SETTING2, ARRAY_SIZE(SEQ_SET_E9_OTP_SETTING2));
++	panel_write(priv, SEQ_SET_BA_REGISTER, ARRAY_SIZE(SEQ_SET_BA_REGISTER));
++	panel_write(priv, SEQ_HX83102E_BL, ARRAY_SIZE(SEQ_HX83102E_BL));
++	panel_write(priv, SEQ_HX83102E_BLON, ARRAY_SIZE(SEQ_HX83102E_BLON));
++	panel_write(priv, SEQ_HX83102E_BL_PWM_PREQ, ARRAY_SIZE(SEQ_HX83102E_BL_PWM_PREQ));
++	panel_write(priv, SEQ_SET_CABC_PRIORITY_SETTING, ARRAY_SIZE(SEQ_SET_CABC_PRIORITY_SETTING));
++	panel_write(priv, SEQ_SET_D2_VOP, ARRAY_SIZE(SEQ_SET_D2_VOP));
++	panel_write(priv, SEQ_HX83102E_BL_PAD, ARRAY_SIZE(SEQ_HX83102E_BL_PAD));
++	panel_write(priv, SEQ_SET_D5_GIP_FORWARD, ARRAY_SIZE(SEQ_SET_D5_GIP_FORWARD));
++	panel_write(priv, SEQ_SET_D6_GIP_BACKWARD, ARRAY_SIZE(SEQ_SET_D6_GIP_BACKWARD));
++	panel_write(priv, SEQ_SET_B4_TIMING, ARRAY_SIZE(SEQ_SET_B4_TIMING));
++	panel_write(priv, SEQ_SET_D3_GIP0, ARRAY_SIZE(SEQ_SET_D3_GIP0));
++	panel_write(priv, SEQ_SET_D1_TP_CTRL, ARRAY_SIZE(SEQ_SET_D1_TP_CTRL));
++	panel_write(priv, SEQ_SET_B1_POWER, ARRAY_SIZE(SEQ_SET_B1_POWER));
++	panel_write(priv, SEQ_SET_B2_RESOLUTION, ARRAY_SIZE(SEQ_SET_B2_RESOLUTION));
++	panel_write(priv, SEQ_SET_E0_ANALOG_GAMMA, ARRAY_SIZE(SEQ_SET_E0_ANALOG_GAMMA));
++	panel_write(priv, SEQ_SET_C0_GAMMA_OPT, ARRAY_SIZE(SEQ_SET_C0_GAMMA_OPT));
++	panel_write(priv, SEQ_SET_CC_NORMALLY_BLACK, ARRAY_SIZE(SEQ_SET_CC_NORMALLY_BLACK));
++	panel_write(priv, SEQ_SET_C8_CP, ARRAY_SIZE(SEQ_SET_C8_CP));
++	panel_write(priv, SEQ_SET_BF_GAS, ARRAY_SIZE(SEQ_SET_BF_GAS));
++	panel_write(priv, SEQ_SET_D0_CASCADE, ARRAY_SIZE(SEQ_SET_D0_CASCADE));
++	panel_write(priv, SEQ_SET_BD_BANK01, ARRAY_SIZE(SEQ_SET_BD_BANK01));
++	panel_write(priv, SEQ_SET_D3_GIP1, ARRAY_SIZE(SEQ_SET_D3_GIP1));
++	panel_write(priv, SEQ_SET_BD_BANK02, ARRAY_SIZE(SEQ_SET_BD_BANK02));
++	panel_write(priv, SEQ_SET_B4_GAMMA_BIAS, ARRAY_SIZE(SEQ_SET_B4_GAMMA_BIAS));
++	panel_write(priv, SEQ_SET_BF_VCOM, ARRAY_SIZE(SEQ_SET_BF_VCOM));
++	panel_write(priv, SEQ_SET_D8_GIP, ARRAY_SIZE(SEQ_SET_D8_GIP));
++	panel_write(priv, SEQ_SET_BD_BANK00, ARRAY_SIZE(SEQ_SET_BD_BANK00));
++	panel_write(priv, SEQ_SET_E7_TOUCH_BANK0, ARRAY_SIZE(SEQ_SET_E7_TOUCH_BANK0));
++	panel_write(priv, SEQ_SET_BD_BANK01, ARRAY_SIZE(SEQ_SET_BD_BANK01));
++	panel_write(priv, SEQ_SET_E7_TOUCH_BANK1, ARRAY_SIZE(SEQ_SET_E7_TOUCH_BANK1));
++	panel_write(priv, SEQ_SET_BD_BANK02, ARRAY_SIZE(SEQ_SET_BD_BANK02));
++	panel_write(priv, SEQ_SET_E7_TOUCH_BANK2, ARRAY_SIZE(SEQ_SET_E7_TOUCH_BANK2));
++	panel_write(priv, SEQ_SET_BD_BANK00, ARRAY_SIZE(SEQ_SET_BD_BANK00));
++	panel_write(priv, SEQ_SET_HX83102E_CABC_ON, ARRAY_SIZE(SEQ_SET_HX83102E_CABC_ON));
++	panel_write(priv, SEQ_SET_E4_CABC_BANK0, ARRAY_SIZE(SEQ_SET_E4_CABC_BANK0));
++	panel_write(priv, SEQ_SET_BD_BANK01, ARRAY_SIZE(SEQ_SET_BD_BANK01));
++	panel_write(priv, SEQ_SET_E4_CABC_BANK1, ARRAY_SIZE(SEQ_SET_E4_CABC_BANK1));
++	panel_write(priv, SEQ_SET_BD_BANK00, ARRAY_SIZE(SEQ_SET_BD_BANK00));
++	panel_write(priv, SEQ_SET_C1_DGC_ON, ARRAY_SIZE(SEQ_SET_C1_DGC_ON));
++	panel_write(priv, SEQ_SET_BD_BANK01, ARRAY_SIZE(SEQ_SET_BD_BANK01));
++	panel_write(priv, SEQ_SET_C1_DGC_GAMMA1, ARRAY_SIZE(SEQ_SET_C1_DGC_GAMMA1));
++	panel_write(priv, SEQ_SET_BD_BANK02, ARRAY_SIZE(SEQ_SET_BD_BANK02));
++	panel_write(priv, SEQ_SET_C1_DGC_GAMMA2, ARRAY_SIZE(SEQ_SET_C1_DGC_GAMMA2));
++	panel_write(priv, SEQ_SET_BD_BANK03, ARRAY_SIZE(SEQ_SET_BD_BANK03));
++	panel_write(priv, SEQ_SET_C1_DGC_GAMMA3, ARRAY_SIZE(SEQ_SET_C1_DGC_GAMMA3));
++	panel_write(priv, SEQ_SET_BD_BANK00, ARRAY_SIZE(SEQ_SET_BD_BANK00));
++	panel_write(priv, SEQ_SET_E1_BANK00, ARRAY_SIZE(SEQ_SET_E1_BANK00));
++
++	panel_write(priv, SEQ_SLEEP_OUT, ARRAY_SIZE(SEQ_SLEEP_OUT));
++	panel_write(priv, SEQ_SET_B9_CLOSE_PW, ARRAY_SIZE(SEQ_SET_B9_CLOSE_PW));
++	msleep(130);
++
++	return 0;
++}
++
++int exynos9610_panel_display_on(struct exynos9610_drm *priv)
++{
++	panel_write(priv, SEQ_SET_B9_PW, ARRAY_SIZE(SEQ_SET_B9_PW));
++	panel_write(priv, SEQ_DISPLAY_ON, ARRAY_SIZE(SEQ_DISPLAY_ON));
++	panel_write(priv, SEQ_SET_B9_CLOSE_PW, ARRAY_SIZE(SEQ_SET_B9_CLOSE_PW));
++	msleep(30);
++
++	return exynos9610_panel_set_brightness(priv, exynos9610_brightness);
++}
++
++void exynos9610_panel_suspend(struct exynos9610_drm *priv)
++{
++	panel_write(priv, SEQ_SET_B9_PW, ARRAY_SIZE(SEQ_SET_B9_PW));
++	panel_write(priv, SEQ_DISPLAY_OFF, ARRAY_SIZE(SEQ_DISPLAY_OFF));
++	panel_write(priv, SEQ_SET_E9_VSOM_SOFT1, ARRAY_SIZE(SEQ_SET_E9_VSOM_SOFT1));
++	panel_write(priv, SEQ_SET_BF_VSOM_SOFT, ARRAY_SIZE(SEQ_SET_BF_VSOM_SOFT));
++	panel_write(priv, SEQ_SET_E9_VSOM_SOFT2, ARRAY_SIZE(SEQ_SET_E9_VSOM_SOFT2));
++	panel_write(priv, SEQ_SLEEP_IN, ARRAY_SIZE(SEQ_SLEEP_IN));
++	panel_write(priv, SEQ_SET_B9_CLOSE_PW, ARRAY_SIZE(SEQ_SET_B9_CLOSE_PW));
++}
++
++int exynos9610_panel_set_brightness(struct exynos9610_drm *priv, int level)
++{
++	u8 bl[3];
++
++	level = clamp(level, 0, EXTEND_BRIGHTNESS);
++	bl[0] = 0x51;
++	bl[1] = (brightness_table[level] >> 8) & 0xf;
++	bl[2] = brightness_table[level] & 0xff;
++
++	return panel_write(priv, bl, sizeof(bl));
++}
+--- /dev/null
++++ b/drivers/gpu/drm/exynos9610/hx83102e_seq.h
+@@ -0,0 +1,386 @@
++#ifndef __HX83102E_PARAM_H__
++#define __HX83102E_PARAM_H__
++#include <linux/types.h>
++#include <linux/kernel.h>
++
++#define EXTEND_BRIGHTNESS	306
++#define UI_MAX_BRIGHTNESS	255
++#define UI_DEFAULT_BRIGHTNESS	128
++
++struct lcd_seq_info {
++	const unsigned char	*cmd;
++	unsigned int	len;
++	unsigned int	sleep;
++};
++
++#if defined(CONFIG_SEC_AOT)
++extern int aot_enabled;
++#endif
++
++extern u32 dphy_timing[][10];
++
++static const unsigned char SEQ_SET_B9_PW[] = {
++	0xB9,
++	0x83, 0x10, 0x2E,
++};
++
++static const unsigned char SEQ_SET_E9_OTP_SETTING[] = {
++	0xE9,
++	0xCD,
++};
++
++static const unsigned char SEQ_SET_BB_OTP_SETTING[] = {
++	0xBB,
++	0x01,
++};
++
++static const unsigned char SEQ_SET_E9_OTP_SETTING2[] = {
++	0xE9,
++	0x00,
++};
++
++static const unsigned char SEQ_SET_BA_REGISTER[] = {
++	0xBA,
++	0x70, 0x03, 0xA8, 0x83, 0xF2, 0x80, 0x00, 0x0D,
++};
++
++static const unsigned char SEQ_HX83102E_BL[] = {
++	0x51,
++	0x00, 0x00,
++};
++
++static const unsigned char SEQ_HX83102E_BLON[] = {
++	0x53,
++	0x24,
++};
++
++static const unsigned char SEQ_HX83102E_BL_PWM_PREQ[] = {
++	0xC9,
++	0x04, 0x0B, 0x5D,
++};
++
++static const unsigned char SEQ_SET_CABC_PRIORITY_SETTING[] = {
++	0xCE,
++	0x00, 0x50, 0xF0,
++};
++
++static const unsigned char SEQ_SET_D2_VOP[] = {
++	0xD2,
++	0xE8, 0xE8,
++};
++
++static const unsigned char SEQ_HX83102E_BL_PAD[] = {
++	0xD9,
++	0x04, 0x01, 0x02,
++};
++
++static const unsigned char SEQ_SET_D5_GIP_FORWARD[] = {
++	0xD5,
++	0x03, 0x02, 0x01, 0x00, 0x07, 0x06, 0x05, 0x04,
++	0x18, 0x18, 0x24, 0x24, 0x19, 0x19, 0x18, 0x18,
++	0x19, 0x19, 0x21, 0x20, 0x23, 0x22, 0x18, 0x18,
++	0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
++	0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
++	0x18, 0x18, 0x18, 0x18,
++};
++
++static const unsigned char SEQ_SET_D6_GIP_BACKWARD[] = {
++	0xD6,
++	0x04, 0x05, 0x06, 0x07, 0x00, 0x01, 0x02, 0x03,
++	0x18, 0x18, 0x24, 0x24, 0x19, 0x19, 0x19, 0x19,
++	0x18, 0x18, 0x22, 0x23, 0x20, 0x21, 0x18, 0x18,
++	0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
++	0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
++	0x18, 0x18, 0x18, 0x18,
++};
++
++static const unsigned char SEQ_SET_B4_TIMING[] = {
++	0xB4,
++	0x80, 0x60, 0x01, 0x01, 0x80, 0x60, 0x68, 0x50,
++	0x01, 0x8E, 0x01, 0x58, 0x00, 0xFF, 0x00, 0xFF,
++};
++
++static const unsigned char SEQ_SET_D3_GIP0[] = {
++	0xD3,
++	0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x08,
++	0x08, 0x27, 0x27, 0x22, 0x2F, 0x23, 0x23, 0x04,
++	0x04, 0x32, 0x10, 0x21, 0x00, 0x21, 0x32, 0x10,
++	0x1F, 0x00, 0x02, 0x32, 0x17, 0xFD, 0x00, 0x10,
++	0x00, 0x00, 0x20, 0x30, 0x01, 0x55, 0x21, 0x38,
++	0x01, 0x55,
++};
++
++static const unsigned char SEQ_SET_D1_TP_CTRL[] = {
++	0xD1,
++	0x67, 0x0C, 0xFF, 0x05,
++};
++
++static const unsigned char SEQ_SET_B1_POWER[] = {
++	0xB1,
++	0x10, 0xFA, 0xAF, 0xAF, 0x29, 0x2D, 0xB2, 0x57,
++	0x4D, 0x36, 0x36, 0x36, 0x36, 0x22, 0x21, 0x15,
++	0x00,
++};
++
++/* A/D low temp < -15 C, VGH :17.4V 65H */
++static const unsigned char SEQ_SET_B1_POWER_LOW_TEMP[] = {
++	0xB1,
++	0x10, 0xFA, 0xAF, 0xAF, 0x29, 0x2D, 0xB2, 0x65,
++	0x4D, 0x36, 0x36, 0x36, 0x36, 0x22, 0x21, 0x15,
++	0x00,
++};
++
++static const unsigned char SEQ_SET_B2_RESOLUTION[] = {
++	0xB2,
++	0x00, 0xB0, 0x47, 0xD0, 0x00, 0x14, 0x3C, 0x2E,
++};
++
++static const unsigned char SEQ_SET_E0_ANALOG_GAMMA[] = {
++	0xE0,
++	0x00, 0x01, 0x0A, 0x11, 0x19, 0x2B, 0x44, 0x4C,
++	0x55, 0x53, 0x71, 0x76, 0x7D, 0x8C, 0x89, 0x91,
++	0x9A, 0xAD, 0xAC, 0x56, 0x5E, 0x68, 0x73, 0x00,
++	0x09, 0x12, 0x19, 0x1F, 0x37, 0x4E, 0x54, 0x5B,
++	0x57, 0x6F, 0x74, 0x79, 0x86, 0x83, 0x89, 0x90,
++	0xA3, 0xA2, 0x50, 0x58, 0x64, 0x73,
++};
++
++static const unsigned char SEQ_SET_C0_GAMMA_OPT[] = {
++	0xC0,
++	0x23, 0x23, 0x22, 0x11, 0xA2, 0x13, 0x00, 0x80,
++	0x00, 0x00, 0x08, 0x00, 0x63, 0x63,
++};
++
++static const unsigned char SEQ_SET_CC_NORMALLY_BLACK[] = {
++	0xCC,
++	0x02,
++};
++
++static const unsigned char SEQ_SET_C8_CP[] = {
++	0xC8,
++	0x00, 0x04, 0x04, 0x00, 0x00, 0x82,
++};
++
++static const unsigned char SEQ_SET_BF_GAS[] = {
++	0xBF,
++	0xFC, 0x85, 0x80,
++};
++
++static const unsigned char SEQ_SET_D0_CASCADE[] = {
++	0xD0,
++	0x07, 0x04, 0x05,
++};
++
++static const unsigned char SEQ_SET_BD_BANK01[] = {
++	0xBD,
++	0x01,
++};
++
++static const unsigned char SEQ_SET_D3_GIP1[] = {
++	0xD3,
++	0x01, 0x00, 0xFC, 0x00, 0x00, 0x11, 0x10, 0x00,
++	0x0E,
++};
++
++static const unsigned char SEQ_SET_BD_BANK02[] = {
++	0xBD,
++	0x02,
++};
++
++static const unsigned char SEQ_SET_B4_GAMMA_BIAS[] = {
++	0xB4,
++	0x4E,
++};
++
++static const unsigned char SEQ_SET_BF_VCOM[] = {
++	0xBF,
++	0xF2,
++};
++
++static const unsigned char SEQ_SET_D8_GIP[] = {
++	0xD8,
++	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0xFF, 0xFF,
++	0xFF, 0xFF, 0xFF, 0xF0,
++};
++
++static const unsigned char SEQ_SET_BD_BANK00[] = {
++	0xBD,
++	0x00,
++};
++
++static const unsigned char SEQ_SET_E7_TOUCH_BANK0[] = {
++	0xE7,
++	0x12, 0x13, 0x02, 0x02, 0x2B, 0x00, 0x0E, 0x0E,
++	0x00, 0x02, 0x27, 0x76, 0x1E, 0x76, 0x01, 0x27,
++	0x00, 0x00, 0x00, 0x00, 0x17, 0x00,
++};
++
++static const unsigned char SEQ_SET_E7_TOUCH_BANK1[] = {
++	0xE7,
++	0x02, 0x30, 0x01, 0x94, 0x0D, 0xB8, 0x0E,
++};
++
++static const unsigned char SEQ_SET_E7_TOUCH_BANK2[] = {
++	0xE7,
++	0xFF, 0x01, 0xFD, 0x01, 0x00, 0x00, 0x22, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x81, 0x00, 0x02, 0x40,
++};
++
++static const unsigned char SEQ_SET_HX83102E_CABC_ON[] = {
++	0x55,
++	0x01,
++};
++
++static const unsigned char SEQ_SET_E4_CABC_BANK0[] = {
++	0xE4,
++	0x25, 0x41, 0x2C, 0x33, 0x4C, 0x66, 0x81, 0x99,
++	0xB2, 0xCC, 0xE5, 0xFF, 0xFF, 0xFF, 0x03, 0x1E,
++	0x1E, 0x1E, 0x1E, 0x00, 0x00, 0x05, 0x01, 0x14,
++};
++
++static const unsigned char SEQ_SET_E4_CABC_BANK1[] = {
++	0xE4,
++	0xE1, 0xE1, 0xE1, 0xE1, 0xE1, 0xE1, 0xE1, 0xE1,
++	0xC7, 0xB2, 0xA0, 0x90, 0x81, 0x75, 0x69, 0x5F,
++	0x55, 0x4C, 0x44, 0x3D, 0x36, 0x2F, 0x2A, 0x24,
++	0x1E, 0x19, 0x14, 0x10, 0x0D, 0x0B, 0x09, 0x54,
++	0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
++};
++
++static const unsigned char SEQ_SET_C1_DGC_ON[] = {
++	0xC1,
++	0x01,
++};
++
++static const unsigned char SEQ_SET_C1_DGC_GAMMA1[] = {
++	0xC1,
++	0x01, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C,
++	0x20, 0x24, 0x27, 0x2C, 0x30, 0x34, 0x38, 0x3C,
++	0x40, 0x44, 0x48, 0x4C, 0x54, 0x5C, 0x63, 0x6B,
++	0x73, 0x7B, 0x83, 0x8A, 0x92, 0x9A, 0xA2, 0xAA,
++	0xB3, 0xBA, 0xC1, 0xCA, 0xD1, 0xD9, 0xE1, 0xE9,
++	0xF1, 0xF5, 0xF7, 0xF8, 0xFA, 0xFC, 0x00, 0x40,
++	0x4C, 0x0B, 0xE4, 0x5F, 0xF7, 0xF5, 0x08, 0x95,
++	0x03, 0xC0,
++};
++
++static const unsigned char SEQ_SET_C1_DGC_GAMMA2[] = {
++	0xC1,
++	0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C,
++	0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x39, 0x3D,
++	0x41, 0x45, 0x48, 0x4C, 0x55, 0x5C, 0x64, 0x6C,
++	0x74, 0x7C, 0x84, 0x8B, 0x93, 0x9B, 0xA3, 0xAB,
++	0xB4, 0xBB, 0xC3, 0xCB, 0xD3, 0xDB, 0xE3, 0xEB,
++	0xF3, 0xF7, 0xF9, 0xFB, 0xFE, 0xFF, 0x01, 0x45,
++	0x92, 0xA1, 0x5F, 0x3B, 0xF7, 0xFB, 0x13, 0x9B,
++	0xFF, 0x00,
++};
++
++static const unsigned char SEQ_SET_BD_BANK03[] = {
++	0xBD,
++	0x03,
++};
++
++static const unsigned char SEQ_SET_C1_DGC_GAMMA3[] = {
++	0xC1,
++	0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C,
++	0x20, 0x24, 0x28, 0x2D, 0x31, 0x35, 0x3A, 0x3E,
++	0x42, 0x46, 0x49, 0x4E, 0x56, 0x5E, 0x66, 0x6E,
++	0x76, 0x7E, 0x85, 0x8D, 0x95, 0x9D, 0xA4, 0xAC,
++	0xB5, 0xBC, 0xC4, 0xCC, 0xD4, 0xDB, 0xE4, 0xEC,
++	0xF3, 0xF7, 0xF9, 0xFC, 0xFE, 0xFF, 0x15, 0x9A,
++	0xFC, 0x21, 0x5C, 0x40, 0x18, 0x0B, 0x01, 0x30,
++	0xFC, 0x00,
++};
++
++static const unsigned char SEQ_SET_E1_BANK00[] = {
++	0xE1,
++	0x07, 0x00,
++};
++
++static const unsigned char SEQ_SET_B9_CLOSE_PW[] = {
++	0xB9,
++	0x00, 0x00, 0x00,
++};
++
++static const unsigned char SEQ_SLEEP_OUT[] = {
++	0x11,
++};
++
++static const unsigned char SEQ_DISPLAY_ON[] = {
++	0x29,
++};
++
++static const unsigned char SEQ_DISPLAY_OFF[] = {
++	0x28,
++	0x00, 0x00
++};
++
++static const unsigned char SEQ_SLEEP_IN[] = {
++	0x10,
++	0x00, 0x00
++};
++
++static const unsigned char SEQ_SET_HX83102E_CABC_OFF[] = {
++	0x55,
++	0x00,
++};
++
++static const unsigned char SEQ_SET_E9_VSOM_SOFT1[] = {
++	0xE9,
++	0xFF,
++};
++
++static const unsigned char SEQ_SET_BF_VSOM_SOFT[] = {
++	0xBF,
++	0x02,
++};
++
++static const unsigned char SEQ_SET_E9_VSOM_SOFT2[] = {
++	0xE9,
++	0x00,
++};
++
++static const unsigned char SEQ_SET_E4_CABC_BANK0_REWRITE[] = {
++	0xE4,
++	0x2D,
++};
++
++/* platform brightness <-> bl reg */
++static unsigned int brightness_table[EXTEND_BRIGHTNESS + 1] = {
++	0,
++	30, 30, 40, 51, 62, 73, 84, 95, 106, 116, /* 2: 30 */
++	127, 138, 149, 160, 171, 182, 193, 203, 214, 225,
++	236, 247, 258, 269, 280, 290, 301, 312, 323, 334,
++	345, 356, 367, 377, 388, 399, 410, 421, 432, 443,
++	454, 464, 475, 486, 497, 508, 519, 530, 541, 551,
++	562, 573, 584, 595, 606, 617, 628, 638, 649, 660,
++	671, 682, 693, 704, 715, 725, 736, 747, 758, 769,
++	780, 791, 801, 812, 823, 834, 845, 856, 867, 878,
++	888, 899, 910, 921, 932, 943, 954, 965, 975, 986,
++	997, 1008, 1019, 1030, 1041, 1052, 1062, 1073, 1084, 1095,
++	1106, 1117, 1128, 1139, 1149, 1160, 1171, 1182, 1193, 1204,
++	1215, 1226, 1236, 1247, 1258, 1269, 1280, 1291, 1302, 1313,
++	1323, 1334, 1345, 1356, 1367, 1378, 1389, 1400, 1412, 1425, /* 128: 1400 */
++	1438, 1451, 1464, 1477, 1489, 1502, 1515, 1528, 1541, 1554,
++	1566, 1579, 1592, 1605, 1618, 1631, 1643, 1656, 1669, 1682,
++	1695, 1708, 1720, 1733, 1746, 1759, 1772, 1785, 1797, 1810,
++	1823, 1836, 1849, 1862, 1874, 1887, 1900, 1913, 1926, 1939,
++	1951, 1964, 1977, 1990, 2003, 2016, 2028, 2041, 2054, 2067,
++	2080, 2093, 2105, 2118, 2131, 2144, 2157, 2170, 2182, 2195,
++	2208, 2221, 2234, 2247, 2259, 2272, 2285, 2298, 2311, 2324,
++	2336, 2349, 2362, 2375, 2388, 2401, 2413, 2426, 2439, 2452,
++	2465, 2478, 2490, 2503, 2516, 2529, 2542, 2555, 2567, 2580,
++	2593, 2606, 2619, 2632, 2644, 2657, 2670, 2683, 2696, 2709,
++	2721, 2734, 2747, 2760, 2773, 2786, 2798, 2811, 2824, 2837,
++	2850, 2863, 2875, 2888, 2901, 2914, 2927, 2940, 2952, 2965,
++	2978, 2991, 3004, 3017, 3030, 3030, 3030, 3030, 3030, 3030, /* 255: 3030 */
++	3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030,
++	3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030,
++	3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030,
++	3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030, 3030,
++	3030, 3030, 3030, 3030, 3030, 3445,
++};
++#endif /* __HX83102E_PARAM_H__ */

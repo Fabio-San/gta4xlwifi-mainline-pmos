@@ -1,0 +1,67 @@
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl.dts
+@@ -43,7 +43,63 @@
+ 
+ 	reserved-memory {
+ 		cont_splash_rmem: framebuffer@ca000000 {
+-			reg = <0 0xca000000 (1200 * 2000 * 4)>;
++			reg = <0 0xca000000 0x1400000>;
++			no-map;
++		};
++
++		/* Fixed firmware carveouts from the SM-P615 rev7 live DTB.
++		 * These remain owned by firmware even without Linux drivers.
++		 */
++		firmware@80000000 {
++			reg = <0 0x80000000 0x2000>;
++			no-map;
++		};
++		el2-code@87000000 {
++			reg = <0 0x87000000 0x200000>;
++			no-map;
++		};
++		firmware-debug@91200000 {
++			reg = <0 0x91200000 0xb88000>;
++			no-map;
++		};
++		ect@a0000000 {
++			reg = <0 0xa0000000 0x3a000>;
++			no-map;
++		};
++		secure-log@c0000000 {
++			reg = <0 0xc0000000 0x80000>;
++			no-map;
++		};
++		camera@db900000 {
++			reg = <0 0xdb900000 0x700000>;
++			no-map;
++		};
++		secure-camera@e1900000 {
++			reg = <0 0xe1900000 0x2000000>;
++			no-map;
++		};
++		modem@ed000000 {
++			reg = <0 0xed000000 0xa800000>;
++			no-map;
++		};
++		firmware-debug@f9000000 {
++			reg = <0 0xf9000000 0xd10000>;
++			no-map;
++		};
++		firmware-debug@f9f10000 {
++			reg = <0 0xf9f10000 0x800000>;
++			no-map;
++		};
++		gnss@fb000000 {
++			reg = <0 0xfb000000 0x800000>;
++			no-map;
++		};
++		sensorhub@fd000000 {
++			reg = <0 0xfd000000 0x80000>;
++			no-map;
++		};
++		el2-early@8fe600000 {
++			reg = <8 0xfe600000 0x1a00000>;
+ 			no-map;
+ 		};
+ 	};

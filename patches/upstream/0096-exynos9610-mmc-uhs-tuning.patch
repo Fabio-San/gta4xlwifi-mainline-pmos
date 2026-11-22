@@ -1,0 +1,145 @@
+--- a/drivers/clk/samsung/clk-exynos9610.c
++++ b/drivers/clk/samsung/clk-exynos9610.c
+@@ -3159,8 +3159,9 @@
+ static const struct samsung_mux_clock fsys_mux_clks[] __initconst = {
+ 	MUX(CLK_MOUT_PLL_FSYS_BUS_USER, "mout_pll_fsys_bus_user", mout_pll_fsys_bus_user_p,
+ 	    PLL_CON0_MUX_CLKCMU_FSYS_BUS_USER, 4, 1),
+-	MUX(CLK_MOUT_PLL_FSYS_MMC_CARD_USER, "mout_pll_fsys_mmc_card_user",
+-	    mout_pll_fsys_mmc_card_user_p, PLL_CON0_MUX_CLKCMU_FSYS_MMC_CARD_USER, 4, 1),
++	MUX_F(CLK_MOUT_PLL_FSYS_MMC_CARD_USER, "mout_pll_fsys_mmc_card_user",
++	      mout_pll_fsys_mmc_card_user_p, PLL_CON0_MUX_CLKCMU_FSYS_MMC_CARD_USER,
++	      4, 1, CLK_SET_RATE_PARENT, 0),
+ 	MUX(CLK_MOUT_PLL_FSYS_MMC_EMBD_USER, "mout_pll_fsys_mmc_embd_user",
+ 	    mout_pll_fsys_mmc_embd_user_p, PLL_CON0_MUX_CLKCMU_FSYS_MMC_EMBD_USER, 4, 1),
+ 	MUX(CLK_MOUT_PLL_FSYS_UFS_EMBD_USER, "mout_pll_fsys_ufs_embd_user",
+@@ -3192,7 +3193,7 @@
+ 	     21, 0, 0),
+ 	GATE(CLK_GOUT_FSYS_MMC_CARD_SDCLKIN, "gout_fsys_mmc_card_sdclkin",
+ 	     "mout_pll_fsys_mmc_card_user", CLK_CON_GAT_GOUT_FSYS_MMC_CARD_SDCLKIN,
+-	     21, 0, 0),
++	     21, CLK_SET_RATE_PARENT, 0),
+ 	GATE(CLK_GOUT_FSYS_MMC_EMBD_ACLK, "gout_fsys_mmc_embd_aclk",
+ 	     "mout_pll_fsys_bus_user", CLK_CON_GAT_GOUT_FSYS_MMC_EMBD_ACLK,
+ 	     21, 0, 0),
+--- a/drivers/clk/samsung/clk-pll.c
++++ b/drivers/clk/samsung/clk-pll.c
+@@ -792,6 +792,9 @@
+ 	sdiv = (pll_con0 >> PLL46XX_SDIV_SHIFT) & PLL46XX_SDIV_MASK;
+ 	kdiv = pll->type == pll_4650c ? pll_con1 & PLL4650C_KDIV_MASK :
+ 					pll_con1 & PLL46XX_KDIV_MASK;
++	/* PLL1061x stores a signed 16-bit fractional divider. */
++	if (pll->type == pll_1061x && (kdiv & BIT(15)))
++		kdiv |= ~PLL46XX_KDIV_MASK;
+ 
+ 	shift = ((pll->type == pll_4600) || (pll->type == pll_1460x)
+ 		 || (pll->type == pll_1061x)) ? 16 : 10;
+@@ -877,7 +880,7 @@
+ 	con1 &= ~((PLL46XX_KDIV_MASK << PLL46XX_KDIV_SHIFT) |
+ 			(PLL46XX_MFR_MASK << PLL46XX_MFR_SHIFT) |
+ 			(PLL46XX_MRR_MASK << PLL46XX_MRR_SHIFT));
+-	con1 |= (rate->kdiv << PLL46XX_KDIV_SHIFT) |
++	con1 |= ((rate->kdiv & PLL46XX_KDIV_MASK) << PLL46XX_KDIV_SHIFT) |
+ 			(rate->mfr << PLL46XX_MFR_SHIFT) |
+ 			(rate->mrr << PLL46XX_MRR_SHIFT);
+ 
+--- a/drivers/mmc/host/dw_mmc-exynos.c
++++ b/drivers/mmc/host/dw_mmc-exynos.c
+@@ -38,6 +38,8 @@
+ 	u8				ciu_div;
+ 	u32				sdr_timing;
+ 	u32				ddr_timing;
++	u32				sdr50_timing;
++	u32				sdr104_timing;
+ 	u32				hs400_timing;
+ 	u32				tuned_sample;
+ 	u32				cur_speed;
+@@ -352,9 +354,19 @@
+ 			wanted <<= 1;
+ 		break;
+ 	case MMC_TIMING_UHS_SDR104:
++		if (priv->sdr104_timing)
++			clksel = SDMMC_CLKSEL_UP_SAMPLE(priv->sdr104_timing,
++							priv->tuned_sample);
++		else
++			clksel = (priv->sdr_timing & 0xfff8ffff) |
++				(priv->ciu_div << 16);
++		break;
+ 	case MMC_TIMING_UHS_SDR50:
+-		clksel = (priv->sdr_timing & 0xfff8ffff) |
+-			(priv->ciu_div << 16);
++		if (priv->sdr50_timing)
++			clksel = priv->sdr50_timing;
++		else
++			clksel = (priv->sdr_timing & 0xfff8ffff) |
++				(priv->ciu_div << 16);
+ 		break;
+ 	case MMC_TIMING_UHS_DDR50:
+ 		clksel = (priv->ddr_timing & 0xfff8ffff) |
+@@ -415,6 +427,16 @@
+ 
+ 	priv->ddr_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1], div);
+ 
++	if (!of_property_read_u32_array(np,
++			"samsung,dw-mshc-sdr50-timing", timing, 2))
++		priv->sdr50_timing =
++			SDMMC_CLKSEL_TIMING(timing[0], timing[1], div);
++
++	if (!of_property_read_u32_array(np,
++			"samsung,dw-mshc-sdr104-timing", timing, 2))
++		priv->sdr104_timing =
++			SDMMC_CLKSEL_TIMING(timing[0], timing[1], div);
++
+ 	ret = of_property_read_u32_array(np,
+ 			"samsung,dw-mshc-hs400-timing", timing, 2);
+ 	if (!ret && of_property_read_u32(np,
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -41,7 +41,7 @@
+ 			regulators {
+ 				vqmmc: ldo2 {
+ 					regulator-name = "vqmmc";
+-					regulator-min-microvolt = <2900000>;
++					regulator-min-microvolt = <1800000>;
+ 					regulator-max-microvolt = <2900000>;
+ 				};
+ 
+@@ -188,6 +188,9 @@
+ 		#clock-cells = <1>;
+ 		clocks = <&oscclk>;
+ 		clock-names = "oscclk";
++		/* The MMC divider needs 800 MHz for exact card clock steps. */
++		assigned-clocks = <&cmu_top CLK_FOUT_MMC_PLL>;
++		assigned-clock-rates = <800000000>;
+ 	};
+ 
+ 	cmu_g3d: clock-controller@11430000 {
+@@ -280,7 +283,7 @@
+ 			      "dout_cmu_fsys_ufs_embd";
+ 	};
+ 
+-	/* Start at 2.9 V / 25 MHz; high-speed tuning follows. */
++	/* Start at 2.9 V; high-speed and UHS tuning follows. */
+ 	mmc: mmc@13550000 {
+ 		compatible = "samsung,exynos9610-dw-mshc";
+ 		reg = <0x13550000 0x2000>;
+@@ -296,14 +299,18 @@
+ 		fifo-depth = <0x40>;
+ 		broken-cd;
+ 		disable-wp;
+-		no-1-8-v;
+ 		no-mmc;
+ 		no-sdio;
+ 		post-power-on-delay-ms = <200>;
+-		max-frequency = <25000000>;
++		cap-sd-highspeed;
++		sd-uhs-sdr50;
++		sd-uhs-sdr104;
++		max-frequency = <200000000>;
+ 		samsung,dw-mshc-ciu-div = <3>;
+ 		samsung,dw-mshc-sdr-timing = <0 2>;
+ 		samsung,dw-mshc-ddr-timing = <1 2>;
++		samsung,dw-mshc-sdr50-timing = <2 4>;
++		samsung,dw-mshc-sdr104-timing = <0 3>;
+ 	};
+ };
+ 

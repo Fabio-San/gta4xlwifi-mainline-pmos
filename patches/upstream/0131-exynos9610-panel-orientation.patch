@@ -1,0 +1,25 @@
+--- a/drivers/gpu/drm/exynos9610/exynos9610_drm.c
++++ b/drivers/gpu/drm/exynos9610/exynos9610_drm.c
+@@ -60,6 +60,11 @@
+ module_param_named(brightness, exynos9610_brightness, int, 0644);
+ MODULE_PARM_DESC(brightness, "Default panel brightness (0-306)");
+ 
++static int panel_orientation = DRM_MODE_PANEL_ORIENTATION_RIGHT_UP;
++module_param(panel_orientation, int, 0444);
++MODULE_PARM_DESC(panel_orientation,
++		 "DRM panel orientation (0 normal, 1 bottom-up, 2 left-up, 3 right-up; -1 unset)");
++
+ static inline struct exynos9610_drm *pipe_to_priv(struct drm_simple_display_pipe *pipe)
+ {
+ 	return container_of(pipe, struct exynos9610_drm, pipe);
+@@ -673,6 +678,10 @@
+ 				 &exynos9610_connector_helpers);
+ 	priv->connector.display_info.width_mm = priv->mode.width_mm;
+ 	priv->connector.display_info.height_mm = priv->mode.height_mm;
++	if (panel_orientation >= DRM_MODE_PANEL_ORIENTATION_NORMAL &&
++	    panel_orientation <= DRM_MODE_PANEL_ORIENTATION_RIGHT_UP)
++		drm_connector_set_panel_orientation(&priv->connector,
++						    panel_orientation);
+ 
+ 	ret = drm_simple_display_pipe_init(drm, &priv->pipe,
+ 					   &exynos9610_pipe_funcs,

@@ -1,0 +1,1004 @@
+From: gta4xl Linux port
+Subject: [PATCH] arm64: exynos9610: enable firmware CPU DVFS and thermal cooling
+
+Load the downstream FVP and TMU plugins before publishing ACPM clocks.
+Use cpufreq-dt and shared OPP tables within the stock CPU limits, with
+schedutil selected by the board configuration. Hand over the bootloader TMU
+for calibrated polling and CPU cooling; keep its hardware trips intact.
+Gate clock publication on successful firmware and sensor initialization so
+failures leave PMIC and storage support available at boot frequencies.
+
+diff --git a/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml b/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
+--- a/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
++++ b/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
+@@ -10,7 +10,7 @@
+   - linux-samsung-soc@vger.kernel.org
+ 
+ description: |
+-  ACPM firmware exposes a PMIC protocol through mailbox doorbells and SRAM
++  ACPM firmware exposes PMIC and DVFS protocols through mailbox doorbells and SRAM
+   queues. The Exynos9610 channel table starts at SRAM offset 0x6f00.
+ 
+ properties:
+@@ -23,6 +23,25 @@
+   shmem:
+     maxItems: 1
+ 
++  '#clock-cells':
++    const: 1
++
++  samsung,enable-dvfs:
++    type: boolean
++    description: Load the downstream FVP plugin and expose firmware clocks.
++
++  samsung,thermal:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Calibrated TMU that must bind before CPU clocks are exposed.
++
++  clocks:
++    maxItems: 2
++
++  clock-names:
++    items:
++      - const: cpucl0-switch
++      - const: cpucl1-switch
++
+   pmic:
+     $ref: /schemas/regulator/samsung,s2mpu09.yaml#
+ 
+@@ -31,4 +50,11 @@
+   - mboxes
+   - shmem
+ 
++dependencies:
++  samsung,enable-dvfs:
++    - '#clock-cells'
++    - samsung,thermal
++    - clocks
++    - clock-names
++
+ additionalProperties: false
+diff --git a/Documentation/devicetree/bindings/thermal/samsung,exynos9610-boot-tmu.yaml b/Documentation/devicetree/bindings/thermal/samsung,exynos9610-boot-tmu.yaml
+--- /dev/null
++++ b/Documentation/devicetree/bindings/thermal/samsung,exynos9610-boot-tmu.yaml
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/thermal/samsung,exynos9610-boot-tmu.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung Exynos9610 bootloader-initialized thermal probes
++
++maintainers:
++  - linux-samsung-soc@vger.kernel.org
++
++description: |
++  Handover of an enabled, calibrated TMU. The bootloader configuration,
++  including hardware thermal trips, is retained. Sensor IDs are 0 for GPU,
++  1 for Cortex-A53 and 2 for Cortex-A73. Linux polls these probes.
++
++properties:
++  compatible:
++    const: samsung,exynos9610-boot-tmu
++
++  reg:
++    maxItems: 1
++
++  '#thermal-sensor-cells':
++    const: 1
++
++required:
++  - compatible
++  - reg
++  - '#thermal-sensor-cells'
++
++additionalProperties: false
+diff --git a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -3,6 +3,7 @@
+ #include "exynos9610-gta4xl.dts"
+ #include <dt-bindings/clock/samsung,exynos9610-cmu.h>
+ #include <dt-bindings/soc/samsung,exynos-usi.h>
++#include <dt-bindings/thermal/thermal.h>
+ 
+ / {
+ 	aliases {
+@@ -34,6 +35,12 @@
+ 		compatible = "samsung,exynos9610-acpm-ipc";
+ 		mboxes = <&apm_mailbox>;
+ 		shmem = <&apm_sram>;
++		#clock-cells = <1>;
++		samsung,enable-dvfs;
++		samsung,thermal = <&cpu_tmu>;
++		clocks = <&cmu_top CLK_DOUT_CMU_CPUCL0_SWITCH>,
++			 <&cmu_top CLK_DOUT_CMU_CPUCL1_SWITCH>;
++		clock-names = "cpucl0-switch", "cpucl1-switch";
+ 
+ 		pmic {
+ 			compatible = "samsung,s2mpu09-pmic";
+@@ -401,3 +408,314 @@
+ 		wakeup-source;
+ 	};
+ };
++
++/* Firmware changes the CPU PLL and its calibrated rail voltage together. */
++&cpu0 {
++	clocks = <&acpm 2>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu1 {
++	clocks = <&acpm 2>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu2 {
++	clocks = <&acpm 2>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu3 {
++	clocks = <&acpm 2>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu100 {
++	clocks = <&acpm 3>;
++	operating-points-v2 = <&cluster1_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu101 {
++	clocks = <&acpm 3>;
++	operating-points-v2 = <&cluster1_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu102 {
++	clocks = <&acpm 3>;
++	operating-points-v2 = <&cluster1_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu103 {
++	clocks = <&acpm 3>;
++	operating-points-v2 = <&cluster1_opp>;
++	#cooling-cells = <2>;
++};
++
++/ {
++	cluster0_opp: opp-table-0 {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-403000000 {
++			opp-hz = /bits/ 64 <403000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-598000000 {
++			opp-hz = /bits/ 64 <598000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-702000000 {
++			opp-hz = /bits/ 64 <702000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-806000000 {
++			opp-hz = /bits/ 64 <806000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-910000000 {
++			opp-hz = /bits/ 64 <910000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1053000000 {
++			opp-hz = /bits/ 64 <1053000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1118000000 {
++			opp-hz = /bits/ 64 <1118000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1222000000 {
++			opp-hz = /bits/ 64 <1222000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1326000000 {
++			opp-hz = /bits/ 64 <1326000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1456000000 {
++			opp-hz = /bits/ 64 <1456000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1534000000 {
++			opp-hz = /bits/ 64 <1534000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1638000000 {
++			opp-hz = /bits/ 64 <1638000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1742000000 {
++			opp-hz = /bits/ 64 <1742000000>;
++			clock-latency-ns = <1000000>;
++		};
++	};
++
++	cluster1_opp: opp-table-1 {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-936000000 {
++			opp-hz = /bits/ 64 <936000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1040000000 {
++			opp-hz = /bits/ 64 <1040000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1144000000 {
++			opp-hz = /bits/ 64 <1144000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1248000000 {
++			opp-hz = /bits/ 64 <1248000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1352000000 {
++			opp-hz = /bits/ 64 <1352000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1456000000 {
++			opp-hz = /bits/ 64 <1456000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1508000000 {
++			opp-hz = /bits/ 64 <1508000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1664000000 {
++			opp-hz = /bits/ 64 <1664000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1768000000 {
++			opp-hz = /bits/ 64 <1768000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1898000000 {
++			opp-hz = /bits/ 64 <1898000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-1976000000 {
++			opp-hz = /bits/ 64 <1976000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-2080000000 {
++			opp-hz = /bits/ 64 <2080000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-2184000000 {
++			opp-hz = /bits/ 64 <2184000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-2210000000 {
++			opp-hz = /bits/ 64 <2210000000>;
++			clock-latency-ns = <1000000>;
++		};
++
++		opp-2314000000 {
++			opp-hz = /bits/ 64 <2314000000>;
++			clock-latency-ns = <1000000>;
++		};
++	};
++
++	thermal-zones {
++		cpu-little {
++			polling-delay = <100>;
++			polling-delay-passive = <50>;
++			thermal-sensors = <&cpu_tmu 1>;
++
++			trips {
++				cpu0_throttle0: throttle-0 {
++					temperature = <60000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu0_throttle1: throttle-1 {
++					temperature = <70000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu0_throttle2: throttle-2 {
++					temperature = <76000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				critical {
++					temperature = <105000>;
++					hysteresis = <5000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&cpu0_throttle0>;
++					cooling-device = <&cpu0 4 4>;
++				};
++				map1 {
++					trip = <&cpu0_throttle1>;
++					cooling-device = <&cpu0 8 8>;
++				};
++				map2 {
++					trip = <&cpu0_throttle2>;
++					cooling-device = <&cpu0 12 12>;
++				};
++			};
++		};
++		cpu-big {
++			polling-delay = <100>;
++			polling-delay-passive = <50>;
++			thermal-sensors = <&cpu_tmu 2>;
++
++			trips {
++				cpu100_throttle0: throttle-0 {
++					temperature = <63000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu100_throttle1: throttle-1 {
++					temperature = <75000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu100_throttle2: throttle-2 {
++					temperature = <83000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				critical {
++					temperature = <105000>;
++					hysteresis = <5000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&cpu100_throttle0>;
++					cooling-device = <&cpu100 6 6>;
++				};
++				map1 {
++					trip = <&cpu100_throttle1>;
++					cooling-device = <&cpu100 10 10>;
++				};
++				map2 {
++					trip = <&cpu100_throttle2>;
++					cooling-device = <&cpu100 14 14>;
++				};
++			};
++		};
++		gpu {
++			polling-delay = <100>;
++			polling-delay-passive = <50>;
++			thermal-sensors = <&cpu_tmu 0>;
++
++			trips {
++				critical {
++					temperature = <105000>;
++					hysteresis = <5000>;
++					type = "critical";
++				};
++			};
++		};
++	};
++};
++
++&soc {
++	cpu_tmu: thermal-sensor@10070000 {
++		compatible = "samsung,exynos9610-boot-tmu";
++		reg = <0x10070000 0x700>;
++		#thermal-sensor-cells = <1>;
++	};
++};
+diff --git a/drivers/clk/samsung/clk-acpm.c b/drivers/clk/samsung/clk-acpm.c
+--- a/drivers/clk/samsung/clk-acpm.c
++++ b/drivers/clk/samsung/clk-acpm.c
+@@ -6,6 +6,11 @@
+  */
+ 
+ #include <linux/array_size.h>
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/sizes.h>
+ #include <linux/clk-provider.h>
+ #include <linux/container_of.h>
+ #include <linux/device/devres.h>
+@@ -15,16 +20,28 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/types.h>
++#include <linux/of_platform.h>
+ 
+ struct acpm_clk {
+ 	u32 id;
+ 	struct clk_hw hw;
+ 	unsigned int mbox_chan_id;
+ 	struct acpm_handle *handle;
++	void __iomem *cpu_cmu;
++	struct clk *switch_clk;
++	u32 pll_offset;
++	u32 switch_offset;
++	unsigned long min_rate;
++	unsigned long max_rate;
+ };
+ 
+ struct acpm_clk_variant {
+ 	const char *name;
++	resource_size_t cmu_base;
++	u32 pll_offset;
++	u32 switch_offset;
++	unsigned long min_rate;
++	unsigned long max_rate;
+ };
+ 
+ struct acpm_clk_driver_data {
+@@ -63,6 +80,19 @@
+ 	.mbox_chan_id = 0,
+ };
+ 
++/* IDs match cal-if/exynos9610/acpm_dvfs_exynos9610.h. */
++static const struct acpm_clk_variant exynos9610_acpm_clks[] = {
++	/* Only the two CPU domains are exposed on this port. */
++	[2] = { "acpm_cpucl0", 0x10900000, 0x140, 0x120, 403000000, 1742000000 },
++	[3] = { "acpm_cpucl1", 0x10800000, 0x120, 0x100, 936000000, 2314000000 },
++};
++
++static const struct acpm_clk_driver_data acpm_clk_exynos9610 = {
++	.clks = exynos9610_acpm_clks,
++	.nr_clks = ARRAY_SIZE(exynos9610_acpm_clks),
++	.mbox_chan_id = 0,
++};
++
+ static unsigned long acpm_clk_recalc_rate(struct clk_hw *hw,
+ 					  unsigned long parent_rate)
+ {
+@@ -87,6 +117,66 @@
+ 	.set_rate = acpm_clk_set_rate,
+ };
+ 
++/*
++ * Exynos9610 FVP acknowledges FREQ_GET but returns zero. Like downstream
++ * cal_dfs_get_rate(), read the CPU PLL instead. Firmware retains exclusive
++ * write ownership of the PLL, muxes, dividers and regulator sequencing.
++ * CPUCL0 and CPUCL1 have different PLL offsets; both were checked against
++ * the running firmware's FVMAP PLL headers and downstream CMUCAL registers.
++ */
++static unsigned long exynos9610_cpu_recalc_rate(struct clk_hw *hw,
++					      unsigned long parent_rate)
++{
++	struct acpm_clk *clk = to_acpm_clk(hw);
++	u32 pms, p, m, s;
++
++	if (readl(clk->cpu_cmu + 0x1000) & BIT(0)) {
++		if (!(readl(clk->cpu_cmu + clk->switch_offset) & BIT(4)))
++			return 26000000;
++		return clk_get_rate(clk->switch_clk);
++	}
++
++	pms = readl(clk->cpu_cmu + clk->pll_offset);
++	if (!(pms & BIT(4)))
++		return 26000000;
++	p = FIELD_GET(GENMASK(13, 8), pms);
++	m = FIELD_GET(GENMASK(25, 16), pms);
++	s = FIELD_GET(GENMASK(2, 0), pms);
++	if (!p)
++		return 0;
++
++	return div_u64(26000000ULL * m, p << s);
++}
++
++static int exynos9610_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
++				 unsigned long parent_rate)
++{
++	struct acpm_clk *clk = to_acpm_clk(hw);
++	unsigned long actual;
++	int ret;
++
++	if (rate < clk->min_rate || rate > clk->max_rate)
++		return -EINVAL;
++
++	ret = acpm_clk_set_rate(hw, rate, parent_rate);
++	if (ret)
++		return ret;
++
++	actual = exynos9610_cpu_recalc_rate(hw, parent_rate);
++	if (actual != rate) {
++		pr_err_ratelimited("ACPM CPU%u: requested %lu Hz, read %lu Hz\n",
++				   clk->id - 2, rate, actual);
++		return -EIO;
++	}
++	return 0;
++}
++
++static const struct clk_ops exynos9610_cpu_clk_ops = {
++	.recalc_rate = exynos9610_cpu_recalc_rate,
++	.determine_rate = clk_determine_rate_noop,
++	.set_rate = exynos9610_cpu_set_rate,
++};
++
+ static int acpm_clk_register(struct device *dev, struct acpm_clk *aclk,
+ 			     const char *name)
+ {
+@@ -94,6 +184,10 @@
+ 
+ 	init.name = name;
+ 	init.ops = &acpm_clk_ops;
++	if (aclk->cpu_cmu) {
++		init.ops = &exynos9610_cpu_clk_ops;
++		init.flags = CLK_GET_RATE_NOCACHE;
++	}
+ 	aclk->hw.init = &init;
+ 
+ 	return devm_clk_hw_register(dev, &aclk->hw);
+@@ -101,6 +195,7 @@
+ 
+ static int acpm_clk_probe(struct platform_device *pdev)
+ {
++	const struct acpm_clk_driver_data *data;
+ 	struct acpm_handle *acpm_handle;
+ 	struct clk_hw_onecell_data *clk_data;
+ 	struct clk_hw **hws;
+@@ -109,13 +204,32 @@
+ 	unsigned int mbox_chan_id;
+ 	int i, err, count;
+ 
++	/* Refuse CPU scaling until calibrated thermal monitoring is bound. */
++	if (platform_get_device_id(pdev)->driver_data ==
++	    (kernel_ulong_t)&acpm_clk_exynos9610) {
++		struct device_node *np;
++		struct platform_device *tmu;
++		bool ready;
++
++		np = of_parse_phandle(dev->parent->of_node, "samsung,thermal", 0);
++		if (!np)
++			return -EINVAL;
++		tmu = of_find_device_by_node(np);
++		of_node_put(np);
++		ready = tmu && platform_get_drvdata(tmu);
++		platform_device_put(tmu);
++		if (!ready)
++			return -EPROBE_DEFER;
++	}
++
+ 	acpm_handle = devm_acpm_get_by_node(dev, dev->parent->of_node);
+ 	if (IS_ERR(acpm_handle))
+ 		return dev_err_probe(dev, PTR_ERR(acpm_handle),
+ 				     "Failed to get acpm handle\n");
+ 
+-	count = acpm_clk_gs101.nr_clks;
+-	mbox_chan_id = acpm_clk_gs101.mbox_chan_id;
++	data = (const void *)platform_get_device_id(pdev)->driver_data;
++	count = data->nr_clks;
++	mbox_chan_id = data->mbox_chan_id;
+ 
+ 	clk_data = devm_kzalloc(dev, struct_size(clk_data, hws, count),
+ 				GFP_KERNEL);
+@@ -131,6 +245,27 @@
+ 
+ 	for (i = 0; i < count; i++) {
+ 		struct acpm_clk *aclk = &aclks[i];
++		const struct acpm_clk_variant *variant = &data->clks[i];
++
++		if (!variant->name) {
++			hws[i] = ERR_PTR(-ENOENT);
++			continue;
++		}
++
++		if (variant->cmu_base) {
++			aclk->cpu_cmu = devm_ioremap(dev, variant->cmu_base, SZ_8K);
++			if (!aclk->cpu_cmu)
++				return -ENOMEM;
++			aclk->switch_clk = devm_clk_get(dev->parent,
++						 i == 2 ? "cpucl0-switch" : "cpucl1-switch");
++			if (IS_ERR(aclk->switch_clk))
++				return dev_err_probe(dev, PTR_ERR(aclk->switch_clk),
++						     "Failed to get CPU switch clock\n");
++			aclk->pll_offset = variant->pll_offset;
++			aclk->switch_offset = variant->switch_offset;
++			aclk->min_rate = variant->min_rate;
++			aclk->max_rate = variant->max_rate;
++		}
+ 
+ 		/*
+ 		 * The code assumes the clock IDs start from zero,
+@@ -143,7 +278,7 @@
+ 		hws[i] = &aclk->hw;
+ 
+ 		err = acpm_clk_register(dev, aclk,
+-					acpm_clk_gs101.clks[i].name);
++					data->clks[i].name);
+ 		if (err)
+ 			return dev_err_probe(dev, err,
+ 					     "Failed to register clock\n");
+@@ -154,7 +289,10 @@
+ }
+ 
+ static const struct platform_device_id acpm_clk_id[] = {
+-	{ .name = "gs101-acpm-clk" },
++	{ .name = "gs101-acpm-clk",
++	  .driver_data = (kernel_ulong_t)&acpm_clk_gs101 },
++	{ .name = "exynos9610-acpm-clk",
++	  .driver_data = (kernel_ulong_t)&acpm_clk_exynos9610 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(platform, acpm_clk_id);
+diff --git a/drivers/firmware/samsung/exynos-acpm-dvfs.c b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+--- a/drivers/firmware/samsung/exynos-acpm-dvfs.c
++++ b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+@@ -43,6 +43,23 @@
+ 	return acpm_do_xfer(handle, &xfer);
+ }
+ 
++/* Samsung's 9610 FVP ABI reserves word 3; it is not a timestamp. */
++int acpm_dvfs_set_rate_exynos9610(struct acpm_handle *handle,
++				unsigned int acpm_chan_id, unsigned int clk_id,
++				unsigned long rate)
++{
++	struct acpm_xfer xfer;
++	u32 cmd[4] = { clk_id, rate / HZ_PER_KHZ, ACPM_DVFS_FREQ_REQ, 0 };
++	int ret;
++
++	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, true);
++	ret = acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return ret;
++
++	return FIELD_GET(ACPM_DVFS_ID, cmd[0]) == clk_id ? 0 : -EIO;
++}
++
+ static void acpm_dvfs_init_get_rate_cmd(u32 cmd[4], unsigned int clk_id)
+ {
+ 	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, clk_id);
+diff --git a/drivers/firmware/samsung/exynos-acpm-dvfs.h b/drivers/firmware/samsung/exynos-acpm-dvfs.h
+--- a/drivers/firmware/samsung/exynos-acpm-dvfs.h
++++ b/drivers/firmware/samsung/exynos-acpm-dvfs.h
+@@ -14,6 +14,9 @@
+ int acpm_dvfs_set_rate(struct acpm_handle *handle,
+ 		       unsigned int acpm_chan_id, unsigned int id,
+ 		       unsigned long rate);
++int acpm_dvfs_set_rate_exynos9610(struct acpm_handle *handle,
++				unsigned int acpm_chan_id, unsigned int clk_id,
++				unsigned long rate);
+ unsigned long acpm_dvfs_get_rate(struct acpm_handle *handle,
+ 				 unsigned int acpm_chan_id,
+ 				 unsigned int clk_id);
+diff --git a/drivers/firmware/samsung/exynos-acpm.c b/drivers/firmware/samsung/exynos-acpm.c
+--- a/drivers/firmware/samsung/exynos-acpm.c
++++ b/drivers/firmware/samsung/exynos-acpm.c
+@@ -13,6 +13,7 @@
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/find.h>
++#include <linux/firmware.h>
+ #include <linux/firmware/samsung/exynos-acpm-protocol.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+@@ -53,6 +54,7 @@
+ 	u32 chans;
+ 	u32 reserved1[3];
+ 	u32 num_chans;
++	resource_size_t sram_size;
+ };
+ 
+ /**
+@@ -176,7 +178,9 @@
+ 	struct acpm_chan *chans;
+ 	struct device *dev;
+ 	struct acpm_handle handle;
++	struct acpm_ops ops;
+ 	u32 num_chans;
++	resource_size_t sram_size;
+ };
+ 
+ /**
+@@ -698,6 +702,62 @@
+ 	},
+ };
+ 
++/* Exynos9610's FREQ channel belongs to the dynamically loaded FVP plugin. */
++static int acpm_exynos9610_load_plugin(struct acpm_info *acpm, u32 id,
++					const char *name)
++{
++	const struct firmware *fw;
++	struct acpm_xfer xfer;
++	void __iomem *plugin;
++	u32 cmd[4] = { BIT(25) | (id << 26), 0, 0, 0 };
++	u32 offset, base, size;
++	u32 expected_base = id == 2 ? 0x9000 : 0xa400;
++	int ret;
++
++	if (!of_device_is_compatible(acpm->dev->of_node,
++				     "samsung,exynos9610-acpm-ipc"))
++		return -EINVAL;
++
++	/* struct plugin is twelve 32-bit words in the downstream firmware. */
++	offset = readl(&acpm->shmem->reserved[0]);
++	if (readl(&acpm->shmem->reserved[1]) <= id || (offset & 3) ||
++	    acpm->sram_size < (id + 1) * 48 ||
++	    offset > acpm->sram_size - (id + 1) * 48)
++		return -EINVAL;
++	plugin = acpm->sram_base + offset + id * 48;
++	if (readl(plugin) != id)
++		return -EINVAL;
++	base = readl(plugin + 4) & ~1U;
++	size = readl(plugin + 36);
++	if (base != expected_base || size != 0x1400 ||
++	    base >= acpm->sram_size || size > acpm->sram_size - base)
++		return -EINVAL;
++
++	if (readl(plugin + 32) & 0xff)
++		return 0;
++
++	ret = request_firmware(&fw, name, acpm->dev);
++	if (ret)
++		return ret;
++	if (fw->size != size || (fw->size & 3)) {
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	/* SRAM only supports aligned word accesses. */
++	__iowrite32_copy(acpm->sram_base + base, fw->data, fw->size / 4);
++	release_firmware(fw);
++
++	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), 4, true);
++	ret = acpm_do_xfer(&acpm->handle, &xfer);
++	if (ret)
++		return ret;
++	if (((cmd[0] >> 26) & 7) != id || !(readl(plugin + 32) & 0xff))
++		return -EIO;
++
++	dev_info(acpm->dev, "Plugin %u attached: %s\n", id, name);
++	return 0;
++}
++
+ static int acpm_probe(struct platform_device *pdev)
+ {
+ 	const struct acpm_match_data *match_data;
+@@ -721,6 +781,7 @@
+ 				     "Failed to get shared memory.\n");
+ 
+ 	size = resource_size(&res);
++	acpm->sram_size = size;
+ 	acpm->sram_base = devm_ioremap(dev, res.start, size);
+ 	if (!acpm->sram_base)
+ 		return dev_err_probe(dev, -ENOMEM,
+@@ -738,12 +799,30 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	acpm->handle.ops = &exynos_acpm_driver_ops;
++	acpm->ops = exynos_acpm_driver_ops;
++	if (of_device_is_compatible(dev->of_node, "samsung,exynos9610-acpm-ipc"))
++		acpm->ops.dvfs.set_rate = acpm_dvfs_set_rate_exynos9610;
++	acpm->handle.ops = &acpm->ops;
+ 
+ 	platform_set_drvdata(pdev, acpm);
+ 
+-	/* The Exynos9610 port currently exposes only the PMIC protocol. */
+-	if (!match_data->acpm_clk_dev_name)
++	if (of_property_read_bool(dev->of_node, "samsung,enable-dvfs")) {
++		ret = acpm_exynos9610_load_plugin(acpm, 2, "exynos9610_acpm_fvp.fw");
++		if (!ret)
++			ret = acpm_exynos9610_load_plugin(acpm, 4, "exynos9610_acpm_tmu.fw");
++		if (!ret)
++			ret = acpm_tmu_init(&acpm->handle, 7);
++		if (ret) {
++			/* PMIC/SD remain available even when DVFS cannot start. */
++			dev_err(dev, "FVP initialization failed: %d\n", ret);
++			return devm_of_platform_populate(dev);
++		}
++	}
++
++	/* Only register Exynos9610 clocks when the FVP plugin is ready. */
++	if (!match_data->acpm_clk_dev_name ||
++	    (of_device_is_compatible(dev->of_node, "samsung,exynos9610-acpm-ipc") &&
++	     !of_property_read_bool(dev->of_node, "samsung,enable-dvfs")))
+ 		return devm_of_platform_populate(dev);
+ 
+ 	acpm_clk_pdev = platform_device_register_data(dev,
+@@ -890,6 +969,7 @@
+ 		.compatible = "samsung,exynos9610-acpm-ipc",
+ 		.data = &(const struct acpm_match_data) {
+ 			.initdata_base = 0x6f00,
++			.acpm_clk_dev_name = "exynos9610-acpm-clk",
+ 		},
+ 	},
+ 	{
+diff --git a/drivers/thermal/samsung/Kconfig b/drivers/thermal/samsung/Kconfig
+--- a/drivers/thermal/samsung/Kconfig
++++ b/drivers/thermal/samsung/Kconfig
+@@ -10,3 +10,12 @@
+ 	  the TMU, reports temperature and handles cooling action if defined.
+ 	  This driver uses the Exynos core thermal APIs and TMU configuration
+ 	  data from the supported SoCs.
++
++config EXYNOS9610_BOOT_THERMAL
++	tristate "Exynos9610 bootloader TMU handover"
++	depends on THERMAL_OF && HAS_IOMEM
++	help
++	  Keep the bootloader's TMU configuration and expose calibrated probe
++	  temperatures to Linux thermal zones for CPU frequency throttling.
++	  Requires firmware to leave the three probes and hardware thermal
++	  trips enabled; a disabled or uncalibrated TMU fails the handover.
+diff --git a/drivers/thermal/samsung/Makefile b/drivers/thermal/samsung/Makefile
+--- a/drivers/thermal/samsung/Makefile
++++ b/drivers/thermal/samsung/Makefile
+@@ -4,3 +4,4 @@
+ #
+ obj-$(CONFIG_EXYNOS_THERMAL)			+= exynos_thermal.o
+ exynos_thermal-y				:= exynos_tmu.o
++obj-$(CONFIG_EXYNOS9610_BOOT_THERMAL) += exynos9610_boot_tmu.o
+diff --git a/drivers/thermal/samsung/exynos9610_boot_tmu.c b/drivers/thermal/samsung/exynos9610_boot_tmu.c
+--- /dev/null
++++ b/drivers/thermal/samsung/exynos9610_boot_tmu.c
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos9610 TMU handover. The Samsung bootloader enables all three probes
++ * and programs the hardware over-temperature trips. Retain that setup;
++ * expose calibrated CPU/GPU temperatures for Linux polling and cooling.
++ * Register layout and calibration are from Samsung's downstream TMU driver.
++ */
++#include <linux/bitfield.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/thermal.h>
++
++#define TMU_CONTROL		0x20
++#define TMU_CURRENT_TEMP	0x40
++#define TMU_CORE_EN		BIT(0)
++#define TMU_TWO_POINT		BIT(23)
++#define TMU_TEMP_MASK		GENMASK(8, 0)
++#define TMU_TRIM85_MASK		GENMASK(17, 9)
++
++struct exynos9610_tmu;
++
++struct exynos9610_sensor {
++	struct exynos9610_tmu *tmu;
++	unsigned int id;
++	int error25;
++	int error85;
++};
++
++struct exynos9610_tmu {
++	void __iomem *base;
++	bool two_point;
++	struct exynos9610_sensor sensors[3];
++};
++
++static int exynos9610_get_temp(struct thermal_zone_device *tz, int *temp)
++{
++	struct exynos9610_sensor *sensor = thermal_zone_device_priv(tz);
++	struct exynos9610_tmu *tmu = sensor->tmu;
++	u32 val;
++	int code;
++
++	if (!(readl(tmu->base + TMU_CONTROL) & TMU_CORE_EN))
++		return -EIO;
++
++	/* P0/P1 are packed in TEMP1_0, P2 starts TEMP4_2. */
++	val = readl(tmu->base + TMU_CURRENT_TEMP + (sensor->id == 2 ? 4 : 0));
++	code = (val >> (sensor->id == 1 ? 9 : 0)) & TMU_TEMP_MASK;
++	if (!code || code == TMU_TEMP_MASK)
++		return -EIO;
++
++	if (tmu->two_point)
++		*temp = (code - sensor->error25) * 60000 /
++			(sensor->error85 - sensor->error25) + 25000;
++	else
++		*temp = (code - sensor->error25 + 25) * 1000;
++
++	return 0;
++}
++
++static const struct thermal_zone_device_ops exynos9610_tmu_ops = {
++	.get_temp = exynos9610_get_temp,
++};
++
++static int exynos9610_tmu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct thermal_zone_device *tz;
++	struct exynos9610_tmu *tmu;
++	u32 trim;
++	int i, ret, temp;
++
++	tmu = devm_kzalloc(dev, sizeof(*tmu), GFP_KERNEL);
++	if (!tmu)
++		return -ENOMEM;
++	tmu->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(tmu->base))
++		return PTR_ERR(tmu->base);
++
++	if (!(readl(tmu->base + TMU_CONTROL) & TMU_CORE_EN))
++		return dev_err_probe(dev, -ENODEV, "Bootloader TMU is disabled\n");
++
++	tmu->two_point = readl(tmu->base) & TMU_TWO_POINT;
++	for (i = 0; i < ARRAY_SIZE(tmu->sensors); i++) {
++		struct exynos9610_sensor *sensor = &tmu->sensors[i];
++
++		trim = readl(tmu->base + i * 4);
++		sensor->tmu = tmu;
++		sensor->id = i;
++		sensor->error25 = FIELD_GET(TMU_TEMP_MASK, trim);
++		sensor->error85 = FIELD_GET(TMU_TRIM85_MASK, trim);
++		if (!sensor->error25 ||
++		    (tmu->two_point && sensor->error85 <= sensor->error25))
++			return dev_err_probe(dev, -EINVAL, "Invalid TMU calibration\n");
++
++		tz = devm_thermal_of_zone_register(dev, i, sensor, &exynos9610_tmu_ops);
++		if (IS_ERR(tz))
++			return dev_err_probe(dev, PTR_ERR(tz), "Failed to register probe %d\n", i);
++		ret = exynos9610_get_temp(tz, &temp);
++		if (ret)
++			return dev_err_probe(dev, ret, "TMU probe %d is not reading\n", i);
++		dev_info(dev, "P%d calibrated temperature: %d mC\n", i, temp);
++	}
++
++	platform_set_drvdata(pdev, tmu);
++	return 0;
++}
++
++static const struct of_device_id exynos9610_tmu_match[] = {
++	{ .compatible = "samsung,exynos9610-boot-tmu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, exynos9610_tmu_match);
++
++static struct platform_driver exynos9610_tmu_driver = {
++	.probe = exynos9610_tmu_probe,
++	.driver = {
++		.name = "exynos9610-boot-tmu",
++		.of_match_table = exynos9610_tmu_match,
++	},
++};
++module_platform_driver(exynos9610_tmu_driver);
++
++MODULE_DESCRIPTION("Exynos9610 bootloader TMU handover");
++MODULE_LICENSE("GPL");

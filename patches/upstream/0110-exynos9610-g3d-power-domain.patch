@@ -1,0 +1,34 @@
+--- a/drivers/pmdomain/samsung/exynos-pm-domains.c
++++ b/drivers/pmdomain/samsung/exynos-pm-domains.c
+@@ -81,6 +81,10 @@
+ 	.local_pwr_cfg		= 0xf,
+ };
+ 
++static const struct exynos_pm_domain_config exynos9610_cfg = {
++	.local_pwr_cfg		= 0xf,
++};
++
+ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	{
+ 		.compatible = "samsung,exynos4210-pd",
+@@ -88,6 +92,9 @@
+ 	}, {
+ 		.compatible = "samsung,exynos5433-pd",
+ 		.data = &exynos5433_cfg,
++	}, {
++		.compatible = "samsung,exynos9610-pd",
++		.data = &exynos9610_cfg,
+ 	},
+ 	{ },
+ };
+@@ -128,6 +135,10 @@
+ 	pd->pd.power_on = exynos_pd_power_on;
+ 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
+ 
++	/* Domains whose clock provider cannot yet restore state stay powered. */
++	if (of_property_read_bool(np, "samsung,always-on"))
++		pd->pd.flags |= GENPD_FLAG_ALWAYS_ON;
++
+ 	/*
+ 	 * Some Samsung platforms with bootloaders turning on the splash-screen
+ 	 * and handing it over to the kernel, requires the power-domains to be

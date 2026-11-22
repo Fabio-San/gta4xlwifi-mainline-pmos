@@ -1,0 +1,1126 @@
+--- a/drivers/ufs/host/Kconfig
++++ b/drivers/ufs/host/Kconfig
+@@ -168,3 +168,11 @@
+ 
+ 	  Select this if you have UFS controller on AMD Versal Gen 2 SoC.
+ 	  If unsure, say N.
++
++config SCSI_UFS_EXYNOS9610
++	bool "Samsung Exynos9610/9611 UFS controller"
++	depends on ARCH_EXYNOS && SCSI_UFSHCD_PLATFORM
++	select MFD_SYSCON
++	select SCSI_UFS_VARIABLE_SG_ENTRY_SIZE
++	help
++	  UFS host and vendor PHY calibration for Exynos9610/9611.
+--- a/drivers/ufs/host/Makefile
++++ b/drivers/ufs/host/Makefile
+@@ -16,3 +16,5 @@
+ obj-$(CONFIG_SCSI_UFS_SPRD) += ufs-sprd.o
+ obj-$(CONFIG_SCSI_UFS_TI_J721E) += ti-j721e-ufs.o
+ obj-$(CONFIG_SCSI_UFS_AMD_VERSAL2) += ufs-amd-versal2.o ufshcd-dwc.o
++
++obj-$(CONFIG_SCSI_UFS_EXYNOS9610) += ufs-exynos9610.o ufs-cal-9610.o
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -316,3 +316,30 @@
+ };
+ 
+ #include "exynos9610-gta4xl-wifi.dtsi"
++
++&soc {
++	sysreg_fsys: syscon@13410000 {
++		compatible = "samsung,exynos9610-sysreg", "syscon";
++		reg = <0x13410000 0x2000>;
++	};
++
++	ufs: ufs@13520000 {
++		compatible = "samsung,exynos9610-ufs";
++		reg = <0x13520000 0x200>, <0x13521100 0x200>,
++		      <0x13510000 0x8000>, <0x13530000 0x1000>,
++		      <0x13524000 0x800>;
++		reg-names = "hci", "vs_hci", "unipro", "ufsp", "pma";
++		interrupts = <GIC_SPI 157 IRQ_TYPE_LEVEL_HIGH>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
++		clocks = <&cmu_fsys CLK_GOUT_FSYS_UFS_EMBD_ACLK>,
++			 <&cmu_fsys CLK_GOUT_FSYS_UFS_EMBD_CLK_UNIPRO>,
++			 <&cmu_fsys CLK_GOUT_FSYS_UFS_EMBD_FMP_CLK>;
++		clock-names = "core_clk", "sclk_unipro_main", "fmp";
++		freq-table-hz = <0 0>, <0 0>, <0 0>;
++		samsung,pmu-syscon = <&pmu>;
++		samsung,sysreg = <&sysreg_fsys>;
++		lanes-per-direction = <1>;
++		dma-coherent;
++	};
++};
+--- a/drivers/clk/samsung/clk-exynos9610.c
++++ b/drivers/clk/samsung/clk-exynos9610.c
+@@ -665,6 +665,8 @@
+ 	    CLK_CON_DIV_CLKCMU_FSYS_MMC_CARD, 0, 9),
+ 	DIV(CLK_DOUT_CMU_FSYS_MMC_EMBD, "dout_cmu_fsys_mmc_embd", "gout_cmu_fsys_mmc_embd",
+ 	    CLK_CON_DIV_CLKCMU_FSYS_MMC_EMBD, 0, 9),
++	DIV(CLK_DOUT_CMU_FSYS_UFS_EMBD, "dout_cmu_fsys_ufs_embd", "gout_cmu_fsys_ufs_embd",
++	    CLK_CON_DIV_CLKCMU_FSYS_UFS_EMBD, 0, 4),
+ 	DIV(CLK_DOUT_CMU_G2D_G2D, "dout_cmu_g2d_g2d", "gout_cmu_g2d_g2d",
+ 	    CLK_CON_DIV_CLKCMU_G2D_G2D, 0, 4),
+ 	DIV(CLK_DOUT_CMU_G2D_MSCL, "dout_cmu_g2d_mscl", "gout_cmu_g2d_mscl",
+--- /dev/null
++++ b/drivers/ufs/host/ufs-exynos9610.c
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/* Exynos9610/9611 glue for upstream UFSHCD and Samsung's PHY calibration.
++ * Register sequences adapted from Samsung's GPL SM-P615 UFS driver.
++ */
++#include <linux/clk.h>
++#include <linux/arm-smccc.h>
++#include <linux/delay.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <ufs/ufshcd.h>
++#include <ufs/unipro.h>
++#include "ufshcd-pltfrm.h"
++#include "ufs-cal-9610.h"
++
++struct ufs9610 {
++	struct ufs_hba *hba;
++	void __iomem *hci, *unipro, *pma;
++	struct clk *mclk;
++	struct ufs_cal_param cal;
++	struct uic_pwr_mode pmd;
++	int cal_error;
++	int hce_error;
++};
++
++static inline struct ufs9610 *priv(struct ufs_hba *hba)
++{
++	return ufshcd_get_variant(hba);
++}
++
++void ufs_lld_dme_set(void *h, u32 addr, u32 val)
++{
++	struct ufs9610 *u = h;
++	int ret = ufshcd_dme_set(u->hba, addr, val);
++	if (ret && !u->cal_error) u->cal_error = ret;
++}
++
++void ufs_lld_dme_get(void *h, u32 addr, u32 *val)
++{
++	struct ufs9610 *u = h;
++	int ret = ufshcd_dme_get(u->hba, addr, val);
++	if (ret && !u->cal_error) u->cal_error = ret;
++}
++
++void ufs_lld_dme_peer_set(void *h, u32 addr, u32 val)
++{
++	struct ufs9610 *u = h;
++	int ret = ufshcd_dme_peer_set(u->hba, addr, val);
++	if (ret && !u->cal_error) u->cal_error = ret;
++}
++
++void ufs_lld_pma_write(void *h, u32 val, u32 addr)
++{
++	struct ufs9610 *u = h;
++	u32 stop = readl(u->hci + 0xb0);
++	writel(stop & ~BIT(3), u->hci + 0xb0);
++	writel(val, u->pma + addr);
++	writel(stop | BIT(3), u->hci + 0xb0);
++}
++
++u32 ufs_lld_pma_read(void *h, u32 addr)
++{
++	struct ufs9610 *u = h;
++	u32 stop = readl(u->hci + 0xb0), val;
++	writel(stop & ~BIT(3), u->hci + 0xb0);
++	val = readl(u->pma + addr);
++	writel(stop | BIT(3), u->hci + 0xb0);
++	return val;
++}
++
++void ufs_lld_unipro_write(void *h, u32 val, u32 addr)
++{
++	struct ufs9610 *u = h;
++	writel(val, u->unipro + addr);
++}
++
++void ufs_lld_udelay(u32 val) { udelay(val); }
++void ufs_lld_usleep_delay(u32 min, u32 max) { usleep_range(min, max); }
++unsigned long ufs_lld_get_time_count(unsigned long offset) { return jiffies; }
++unsigned long ufs_lld_calc_timeout(unsigned int ms) { return msecs_to_jiffies(ms); }
++
++static int ufs9610_init(struct ufs_hba *hba)
++{
++	struct platform_device *pdev = to_platform_device(hba->dev);
++	struct ufs9610 *u;
++	struct regmap *pmu, *sysreg;
++	struct arm_smccc_res res;
++	int ret;
++
++	u = devm_kzalloc(hba->dev, sizeof(*u), GFP_KERNEL);
++	if (!u) return -ENOMEM;
++	u->hba = hba;
++	hba->priv = u;
++#define MAP(member, name) do { \
++	u->member = devm_platform_ioremap_resource_byname(pdev, name); \
++	if (IS_ERR(u->member)) return PTR_ERR(u->member); \
++} while (0)
++	MAP(hci, "vs_hci");
++	MAP(unipro, "unipro");
++	MAP(pma, "pma");
++#undef MAP
++	u->mclk = devm_clk_get(hba->dev, "sclk_unipro_main");
++	if (IS_ERR(u->mclk)) return PTR_ERR(u->mclk);
++	if (!clk_get_rate(u->mclk))
++		return dev_err_probe(hba->dev, -EINVAL, "UFS UniPro clock has no rate\n");
++	pmu = syscon_regmap_lookup_by_phandle(hba->dev->of_node, "samsung,pmu-syscon");
++	if (IS_ERR(pmu)) return PTR_ERR(pmu);
++	sysreg = syscon_regmap_lookup_by_phandle(hba->dev->of_node, "samsung,sysreg");
++	if (IS_ERR(sysreg)) return PTR_ERR(sysreg);
++	ret = regmap_update_bits(pmu, 0x724, BIT(0), BIT(0));
++	if (ret) return ret;
++	ret = regmap_update_bits(sysreg, 0x1010, BIT(8) | BIT(9), BIT(8) | BIT(9));
++	if (ret) return ret;
++
++	/* The protector is secure firmware owned, including after warm reset.
++	 * Use Samsung's DESCTYPE_3 + SMU_INIT ABI instead of touching UFSPR.
++	 * Zero crypto fields in 128-byte descriptors select plaintext I/O;
++	 * inline encryption is not advertised to the block layer.
++	 */
++	arm_smccc_smc(0xc2001810, 0, 0, 3, 0, 0, 0, 0, &res);
++	if (res.a0) return dev_err_probe(hba->dev, -EIO,
++		"FMP security setup failed: %ld\n", res.a0);
++	ufshcd_set_sg_entry_size(hba, 128);
++	arm_smccc_smc(0xc2001850, 0, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0) return dev_err_probe(hba->dev, -EIO,
++		"SMU initialization failed: %ld\n", res.a0);
++	hba->quirks |= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
++		UFSHCD_QUIRK_BROKEN_INTR_AGGR | UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR |
++		UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR | UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8 |
++		UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR |
++		UFSHCD_QUIRK_SKIP_DEF_UNIPRO_TIMEOUT_SETTING;
++	/* Keep clocks and the link active until runtime PM is ported/tested. */
++	hba->caps = 0;
++	u->cal.host = u;
++	u->cal.board = 0;
++	return ufs_cal_init(&u->cal, 0) ? -EINVAL : 0;
++}
++
++static int ufs9610_reset_device(struct ufs_hba *hba)
++{
++	struct ufs9610 *u = priv(hba);
++	writel(0, u->hci + 0x70);
++	udelay(5);
++	writel(1, u->hci + 0x70);
++	return 0;
++}
++
++static int ufs9610_hce(struct ufs_hba *hba, enum ufs_notify_change_status status)
++{
++	struct ufs9610 *u = priv(hba);
++	u32 val;
++	int ret;
++
++	if (status == PRE_CHANGE) {
++		u->hce_error = 0;
++		hba->host->max_segment_size = 4096;
++		hba->host->dma_alignment = 4095;
++		writel(readl(u->hci + 0xb4) & ~BIT(4), u->hci + 0xb4);
++		writel(readl(u->hci + 0xb0) & ~0x17, u->hci + 0xb0);
++		writel(readl(u->hci + 0xfc) | BIT(0), u->hci + 0xfc);
++		writel(3, u->hci + 0x50);
++		ret = readl_poll_timeout(u->hci + 0x50, val, !(val & 3), 10, 10000);
++		if (ret) return u->hce_error = ret;
++		u->cal.mclk_rate = clk_get_rate(u->mclk);
++		if (!u->cal.mclk_rate) return u->hce_error = -EINVAL;
++		writel(readl(u->hci + 0x8c) | BIT(16), u->hci + 0x8c);
++		writel((u->cal.mclk_rate / 1000000) & 0x3ff, u->hci + 0x0c);
++		writel(0xa, u->hci + 0x60);
++		writel(BIT(31) | 12, u->hci + 0x00);
++		writel(12, u->hci + 0x04);
++		writel(~0U, u->hci + 0x40);
++		writel(~0U, u->hci + 0x44);
++		writel(BIT(31) | (3 << 27) | 3, u->hci + 0x6c);
++		writel(readl(u->hci + 0x100) & ~BIT(0), u->hci + 0x100);
++		return ufs9610_reset_device(hba);
++	}
++	if (u->hce_error) return u->hce_error;
++	writel(readl(u->hci + 0xb4) | BIT(11) | BIT(10) | BIT(8) |
++	       BIT(7) | BIT(6) | BIT(5), u->hci + 0xb4);
++	writel(readl(u->hci + 0xb0) & ~0x17, u->hci + 0xb0);
++	writel(readl(u->hci + 0xfc) | BIT(0), u->hci + 0xfc);
++	ret = ufshcd_dme_get(hba, UIC_ARG_MIB(PA_AVAILRXDATALANES), &val);
++	if (ret) return ret;
++	if (!val || val > 2) return -EINVAL;
++	u->cal.available_lane = val;
++	dev_info(hba->dev, "UFS mclk=%u lanes=%u\n", u->cal.mclk_rate, val);
++	return 0;
++}
++
++static int ufs9610_link(struct ufs_hba *hba, enum ufs_notify_change_status status)
++{
++	struct ufs9610 *u = priv(hba);
++	u32 val;
++	int ret;
++	if (u->hce_error) return u->hce_error;
++	u->cal_error = 0;
++	if (status == PRE_CHANGE) {
++		writel(BIT(31) | UIC_DATA_LINK_LAYER_ERROR_RX_BUF_OF |
++		       UIC_DATA_LINK_LAYER_ERROR_PA_INIT, u->hci + 0x7c);
++		writel(BIT(31) | UIC_NETWORK_UNSUPPORTED_HEADER_TYPE |
++		       UIC_NETWORK_BAD_DEVICEID_ENC | UIC_NETWORK_LHDR_TRAP_PACKET_DROPPING,
++		       u->hci + 0x80);
++		writel(BIT(31) | UIC_TRANSPORT_UNSUPPORTED_HEADER_TYPE |
++		       UIC_TRANSPORT_UNKNOWN_CPORTID | UIC_TRANSPORT_NO_CONNECTION_RX |
++		       UIC_TRANSPORT_BAD_TC, u->hci + 0x84);
++		ret = ufs_cal_pre_link(&u->cal);
++	} else {
++		ufs_lld_dme_get(u, UIC_ARG_MIB(PA_ACTIVETXDATALANES), &val);
++		u->cal.active_tx_lane = val;
++		ufs_lld_dme_get(u, UIC_ARG_MIB(PA_ACTIVERXDATALANES), &val);
++		u->cal.active_rx_lane = val;
++		ret = ufs_cal_post_link(&u->cal);
++	}
++	dev_info(hba->dev, "UFS link %s cal=%d dme=%d\n",
++		 status == PRE_CHANGE ? "pre" : "post", ret, u->cal_error);
++	return u->cal_error ?: (ret ? -EIO : 0);
++}
++
++static int ufs9610_negotiate(struct ufs_hba *hba,
++		const struct ufs_pa_layer_attr *max, struct ufs_pa_layer_attr *p)
++{
++	*p = *max;
++	p->lane_rx = min_t(u32, max->lane_rx, 1);
++	p->lane_tx = min_t(u32, max->lane_tx, 1);
++	p->gear_rx = min_t(u32, max->gear_rx, 3);
++	p->gear_tx = min_t(u32, max->gear_tx, 3);
++	p->pwr_rx = FAST_MODE;
++	p->pwr_tx = FAST_MODE;
++	p->hs_rate = PA_HS_MODE_B;
++	return 0;
++}
++
++static int ufs9610_power(struct ufs_hba *hba,
++		enum ufs_notify_change_status status, struct ufs_pa_layer_attr *p)
++{
++	struct ufs9610 *u = priv(hba);
++	int ret;
++	u->cal_error = 0;
++	u->pmd.lane = min(p->lane_rx, p->lane_tx);
++	u->pmd.gear = min(p->gear_rx, p->gear_tx);
++	u->pmd.mode = p->pwr_rx;
++	u->pmd.hs_series = p->hs_rate;
++	u->cal.pmd = &u->pmd;
++	u->cal.connected_rx_lane = p->lane_rx;
++	u->cal.connected_tx_lane = p->lane_tx;
++	u->cal.active_rx_lane = p->lane_rx;
++	u->cal.active_tx_lane = p->lane_tx;
++	ret = status == PRE_CHANGE ? ufs_cal_pre_pmc(&u->cal) : ufs_cal_post_pmc(&u->cal);
++	dev_info(hba->dev, "UFS power %s G%u L%u cal=%d dme=%d\n",
++		 status == PRE_CHANGE ? "pre" : "post", u->pmd.gear, u->pmd.lane,
++		 ret, u->cal_error);
++	return u->cal_error ?: (ret ? -EIO : 0);
++}
++
++static void ufs9610_xfer(struct ufs_hba *hba, int tag, bool scsi)
++{
++	struct ufs9610 *u = priv(hba);
++	u32 val = readl(u->hci + 0x40);
++	writel(scsi ? val | BIT(tag) : val & ~BIT(tag), u->hci + 0x40);
++}
++
++static void ufs9610_task(struct ufs_hba *hba, int tag, u8 func)
++{
++	struct ufs9610 *u = priv(hba);
++	u32 val = readl(u->hci + 0x44);
++	bool single = func == UFS_ABORT_TASK || func == UFS_QUERY_TASK;
++	writel(single ? val | BIT(tag) : val & ~BIT(tag), u->hci + 0x44);
++}
++
++static const struct ufs_hba_variant_ops ufs9610_ops = {
++	.name = "exynos9610",
++	.init = ufs9610_init,
++	.hce_enable_notify = ufs9610_hce,
++	.link_startup_notify = ufs9610_link,
++	.negotiate_pwr_mode = ufs9610_negotiate,
++	.pwr_change_notify = ufs9610_power,
++	.setup_xfer_req = ufs9610_xfer,
++	.setup_task_mgmt = ufs9610_task,
++	.device_reset = ufs9610_reset_device,
++};
++
++static int ufs9610_probe(struct platform_device *pdev)
++{
++	int ret = ufshcd_pltfrm_init(pdev, &ufs9610_ops);
++	if (!ret) pm_runtime_forbid(&pdev->dev);
++	return ret;
++}
++
++static const struct of_device_id ufs9610_match[] = {
++	{ .compatible = "samsung,exynos9610-ufs" }, {}
++};
++MODULE_DEVICE_TABLE(of, ufs9610_match);
++
++static struct platform_driver ufs9610_driver = {
++	.probe = ufs9610_probe,
++	.remove = ufshcd_pltfrm_remove,
++	.driver = { .name = "exynos9610-ufs", .of_match_table = ufs9610_match },
++};
++module_platform_driver(ufs9610_driver);
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Exynos9610/9611 UFS host with Samsung PHY calibration");
+--- /dev/null
++++ b/drivers/ufs/host/ufs-cal-9610.c
+@@ -0,0 +1,685 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Samsung Exynos9610 calibration tables from the SM-P615 vendor kernel. */
++#if defined(__UFS_CAL_U_BOOT__)
++#include <linux/types.h>
++#include <ufs-cal-9610.h>
++#elif defined(__UFS_CAL_FW__)
++#include <types.h>
++#include <include/ufs-cal.h>
++#else
++#include <linux/types.h>
++#include "ufs-cal-9610.h"
++#endif
++
++#ifndef _UFS_CAL_
++#define _UFS_CAL_
++
++/* UFSHCI */
++#define UIC_ARG_MIB_SEL(attr, sel)	((((attr) & 0xFFFF) << 16) |\
++					 ((sel) & 0xFFFF))
++#define UIC_ARG_MIB(attr)		UIC_ARG_MIB_SEL(attr, 0)
++
++/* Unipro.h */
++#define IS_PWR_MODE_HS(m)        (((m) == FAST_MODE) || ((m) == FASTAUTO_MODE))
++#define IS_PWR_MODE_PWM(m)       (((m) == SLOW_MODE) || ((m) == SLOWAUTO_MODE))
++
++enum {
++	PA_HS_MODE_A	= 1,
++	PA_HS_MODE_B	= 2,
++};
++
++enum {
++	FAST_MODE	= 1,
++	SLOW_MODE	= 2,
++	FASTAUTO_MODE	= 4,
++	SLOWAUTO_MODE	= 5,
++	UNCHANGED	= 7,
++};
++
++/* User defined */
++#define UNIPRO_MCLK_PERIOD(p) (1000000000L / p->mclk_rate)
++
++#define PHY_PMA_COMN_ADDR(reg)		(reg)
++#define PHY_PMA_TRSV_ADDR(reg, lane)	((reg) + (0x140 * (lane)))
++
++#define NUM_OF_UFS_HOST	1
++
++enum {
++	PHY_CFG_NONE = 0,
++	PHY_PCS_COMN,
++	PHY_PCS_RXTX,
++	PHY_PMA_COMN,
++	PHY_PMA_TRSV,
++	PHY_PLL_WAIT,
++	PHY_CDR_WAIT,
++	PHY_CDR_AFC_WAIT,
++	UNIPRO_STD_MIB,
++	UNIPRO_DBG_MIB,
++	UNIPRO_DBG_APB,
++
++	/* Since exynos8895 */
++	PHY_PCS_RX,
++	PHY_PCS_TX,
++	PHY_PCS_RX_PRD,
++	PHY_PCS_TX_PRD,
++	UNIPRO_DBG_PRD,
++	PHY_PMA_TRSV_LANE1_SQ_OFF,
++	COMMON_WAIT,
++};
++
++enum {
++	TX_LANE_0 = 0,
++	TX_LANE_1 = 1,
++	TX_LANE_2 = 2,
++	TX_LANE_3 = 3,
++	RX_LANE_0 = 4,
++	RX_LANE_1 = 5,
++	RX_LANE_2 = 6,
++	RX_LANE_3 = 7,
++};
++
++enum {
++	__PMD_PWM_G1_L1,
++	__PMD_PWM_G1_L2,
++	__PMD_PWM_G2_L1,
++	__PMD_PWM_G2_L2,
++	__PMD_PWM_G3_L1,
++	__PMD_PWM_G3_L2,
++	__PMD_PWM_G4_L1,
++	__PMD_PWM_G4_L2,
++	__PMD_PWM_G5_L1,
++	__PMD_PWM_G5_L2,
++	__PMD_HS_G1_L1,
++	__PMD_HS_G1_L2,
++	__PMD_HS_G2_L1,
++	__PMD_HS_G2_L2,
++	__PMD_HS_G3_L1,
++	__PMD_HS_G3_L2,
++};
++
++#define PMD_PWM_G1_L1	(1U << __PMD_PWM_G1_L1)
++#define PMD_PWM_G1_L2	(1U << __PMD_PWM_G1_L2)
++#define PMD_PWM_G2_L1	(1U << __PMD_PWM_G2_L1)
++#define PMD_PWM_G2_L2	(1U << __PMD_PWM_G2_L2)
++#define PMD_PWM_G3_L1	(1U << __PMD_PWM_G3_L1)
++#define PMD_PWM_G3_L2	(1U << __PMD_PWM_G3_L2)
++#define PMD_PWM_G4_L1	(1U << __PMD_PWM_G4_L1)
++#define PMD_PWM_G4_L2	(1U << __PMD_PWM_G4_L2)
++#define PMD_PWM_G5_L1	(1U << __PMD_PWM_G5_L1)
++#define PMD_PWM_G5_L2	(1U << __PMD_PWM_G5_L2)
++#define PMD_HS_G1_L1	(1U << __PMD_HS_G1_L1)
++#define PMD_HS_G1_L2	(1U << __PMD_HS_G1_L2)
++#define PMD_HS_G2_L1	(1U << __PMD_HS_G2_L1)
++#define PMD_HS_G2_L2	(1U << __PMD_HS_G2_L2)
++#define PMD_HS_G3_L1	(1U << __PMD_HS_G3_L1)
++#define PMD_HS_G3_L2	(1U << __PMD_HS_G3_L2)
++
++#define PMD_ALL		(PMD_HS_G3_L2 - 1)
++#define PMD_PWM		(PMD_PWM_G4_L2 - 1)
++#define PMD_HS		(PMD_ALL ^ PMD_PWM)
++
++struct ufs_cal_phy_cfg {
++	u32 addr;
++	u32 val;
++	u32 flg;
++	u32 lyr;
++	u8 board;
++};
++
++#define for_each_phy_cfg(cfg) \
++	for (; (cfg)->flg != PHY_CFG_NONE; (cfg)++)
++
++#endif /*_UFS_CAL_ */
++
++static struct ufs_cal_param *ufs_cal[NUM_OF_UFS_HOST];
++static unsigned long ufs_cal_lock_timeout = 0xFFFFFFFF;
++
++static struct ufs_cal_phy_cfg init_cfg[] = {
++	{0x9514, 0x00, PMD_ALL, UNIPRO_DBG_PRD, __BRD_COMMON},
++	{0x200, 0x40, PMD_ALL, PHY_PCS_COMN, __BRD_COMMON},
++	{0x12, 0x00, PMD_ALL, PHY_PCS_RX_PRD, __BRD_COMMON},
++	{0xAA, 0x00, PMD_ALL, PHY_PCS_TX_PRD, __BRD_COMMON},
++	{0x5C, 0x38, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x0F, 0x0, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x65, 0x01, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x69, 0x1, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x21, 0x0, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x22, 0x0, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x84, 0x1, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x04, 0x1, PMD_ALL, PHY_PCS_TX, __BRD_COMMON},
++	{0x8F, 0x3E, PMD_ALL, PHY_PCS_TX, __BRD_COMMON},
++	{0x200, 0x0, PMD_ALL, PHY_PCS_COMN, __BRD_COMMON},
++	{0x9536, 0x4E20, PMD_ALL, UNIPRO_DBG_MIB, __BRD_COMMON},
++	{0x9564, 0x2e820183, PMD_ALL, UNIPRO_DBG_MIB, __BRD_COMMON},
++	{0x155E, 0x0, PMD_ALL, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x3000, 0x0, PMD_ALL, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x3001, 0x1, PMD_ALL, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x4021, 0x1, PMD_ALL, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x4020, 0x1, PMD_ALL, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x8C, 0x80, PMD_ALL, PHY_PMA_COMN, __BRD_COMMON},
++	{0x74, 0x10, PMD_ALL, PHY_PMA_COMN, __BRD_COMMON},
++	{0x110, 0xB5, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0x43, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x16C, 0x20, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x178, 0xC0, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x1B0, 0x94, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0xE0, 0x12, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x164, 0x58, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x8C, 0xC0, PMD_ALL, PHY_PMA_COMN, __BRD_COMMON},
++	{0x8C, 0x00, PMD_ALL, PHY_PMA_COMN, __BRD_COMMON},
++	{0x00, 0xC8, PMD_ALL, COMMON_WAIT, __BRD_COMMON},
++	{},
++};
++
++static struct ufs_cal_phy_cfg post_init_cfg[] = {
++	{0x9529, 0x1, PMD_ALL, UNIPRO_DBG_MIB, __BRD_COMMON},
++	{0x15A4, 0xFA, PMD_ALL, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x9529, 0x0, PMD_ALL, UNIPRO_DBG_MIB, __BRD_COMMON},
++	{0x200, 0x40, PMD_ALL, PHY_PCS_COMN, __BRD_COMMON},
++	{0x35, 0x05, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x73, 0x01, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x41, 0x02, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x42, 0xAC, PMD_ALL, PHY_PCS_RX, __BRD_COMMON},
++	{0x200, 0x0, PMD_ALL, PHY_PCS_COMN, __BRD_COMMON},
++	{},
++};
++
++static struct ufs_cal_phy_cfg calib_of_pwm[] = {
++	{0x2041, 8064, PMD_PWM, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x2042, 28224, PMD_PWM, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x2043, 20160, PMD_PWM, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B0, 12000, PMD_PWM, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B1, 32000, PMD_PWM, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B2, 16000, PMD_PWM, UNIPRO_STD_MIB, __BRD_COMMON},
++
++	{0x7888, 8064, PMD_PWM, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x788C, 28224, PMD_PWM, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x7890, 20160, PMD_PWM, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78B8, 12000, PMD_PWM, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78BC, 32000, PMD_PWM, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78C0, 16000, PMD_PWM, UNIPRO_DBG_APB, __BRD_COMMON},
++
++	//MPHY tuning value
++	{0xC8, 0x40, PMD_PWM, PHY_PMA_TRSV, __BRD_COMMON},
++	{0xF0, 0x77, PMD_PWM, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x120, 0x80, PMD_PWM, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x00, PMD_PWM, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x12C, 0x00, PMD_PWM, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0x43, PMD_PWM, PHY_PMA_TRSV, __BRD_COMMON},
++	{},
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_pwm[] = {
++	{},
++};
++
++static struct ufs_cal_phy_cfg calib_of_hs_rate_a[] = {
++	{0x2041, 8064, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x2042, 28224, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x2043, 20160, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B0, 12000, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B1, 32000, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B2, 16000, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++
++	{0x7888, 8064, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x788C, 28224, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x7890, 20160, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78B8, 12000, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78BC, 32000, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78C0, 16000, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++
++	{0xC8, 0xBC, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0xF0, 0x7F, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x120, 0xC0, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x08, PMD_HS_G1_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x02, PMD_HS_G2_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x00, PMD_HS_G3_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x12C, 0x10, PMD_HS_G1_L2|PMD_HS_G3_L2, PHY_PMA_TRSV, __BRD_SMDK},
++	{0x12C, 0x00, PMD_HS_G2_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0xd3, PMD_HS_G1_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0x73, PMD_HS_G2_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0x63, PMD_HS_G3_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	//RX EQ
++	//{0x108, 0x5D, PMD_HS, PHY_PMA_TRSV, __BRD_SMDK},
++	//{0x108, 0x5D, PMD_HS, PHY_PMA_TRSV, __BRD_ASB},
++
++	//{0x10C, 0xD1, PMD_HS, PHY_PMA_TRSV, __BRD_SMDK},
++	//{0x10C, 0xD1, PMD_HS, PHY_PMA_TRSV, __BRD_ASB},
++	{},
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_hs_rate_a[] = {
++	{0x1fc, 0x40, PMD_HS, PHY_CDR_AFC_WAIT, __BRD_COMMON},
++	{},
++};
++
++static struct ufs_cal_phy_cfg calib_of_hs_rate_b[] = {
++	{0x2041, 8064, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x2042, 28224, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x2043, 20160, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B0, 12000, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B1, 32000, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++	{0x15B2, 16000, PMD_HS, UNIPRO_STD_MIB, __BRD_COMMON},
++
++	{0x7888, 8064, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x788C, 28224, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x7890, 20160, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78B8, 12000, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78BC, 32000, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++	{0x78C0, 16000, PMD_HS, UNIPRO_DBG_APB, __BRD_COMMON},
++
++	//MPHY tuning value
++	{0xC8, 0xBC, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0xF0, 0x7F, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x120, 0xC0, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x08, PMD_HS_G1_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x02, PMD_HS_G2_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x128, 0x00, PMD_HS_G3_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x12C, 0x10, PMD_HS_G1_L2|PMD_HS_G3_L2, PHY_PMA_TRSV, __BRD_SMDK},
++	{0x12C, 0x00, PMD_HS_G2_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0xd3, PMD_HS_G1_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0x73, PMD_HS_G2_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x134, 0x63, PMD_HS_G3_L2, PHY_PMA_TRSV, __BRD_COMMON},
++	//RX EQ
++	//{0x108, 0x5F, PMD_HS, PHY_PMA_TRSV, __BRD_SMDK},
++	//{0x108, 0x5F, PMD_HS, PHY_PMA_TRSV, __BRD_ASB},
++
++	//{0x10C, 0xD0, PMD_HS, PHY_PMA_TRSV, __BRD_SMDK},
++	//{0x10C, 0xD0, PMD_HS, PHY_PMA_TRSV, __BRD_ASB},
++	{},
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_hs_rate_b[] = {
++	{0x1fc, 0x40, PMD_HS, PHY_CDR_AFC_WAIT, __BRD_COMMON},
++	{},
++};
++
++static struct ufs_cal_phy_cfg post_h8_enter[] = {
++	{0x0C4, 0x99, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x0E8, 0x7F, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x0F0, 0x7F, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x004, 0x02, PMD_ALL, PHY_PMA_COMN, __BRD_COMMON},
++	{},
++};
++
++static struct ufs_cal_phy_cfg pre_h8_exit[] = {
++	{0x004, 0x3F, PMD_HS, PHY_PMA_COMN, __BRD_COMMON},
++	{0x004, 0x00, PMD_PWM, PHY_PMA_COMN, __BRD_COMMON},
++	{0x0C4, 0xD9, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x0E8, 0x77, PMD_ALL, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x00,  0x0A, PMD_HS, COMMON_WAIT, __BRD_COMMON},
++	{0x0F0, 0xFF, PMD_HS, PHY_PMA_TRSV, __BRD_COMMON},
++	{0x1fc, 0x01, PMD_HS, PHY_CDR_AFC_WAIT, __BRD_COMMON},
++	{},
++};
++
++static inline ufs_cal_errno ufs_cal_wait_cdr_afc_check(void *hba,
++			u32 addr, u32 mask, int lane)
++{
++	u32 delay_us = 1;
++	u32 delay2_us = 40;
++	u32 reg = 0;
++	u32 i;
++
++	for (i = 0; i < 100; i++) {
++		ufs_lld_usleep_delay(delay2_us, delay2_us);
++
++		reg = ufs_lld_pma_read(hba, PHY_PMA_TRSV_ADDR(addr, lane));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++
++		ufs_lld_usleep_delay(delay_us, delay_us);
++		ufs_lld_pma_write(hba, 0x7F, PHY_PMA_TRSV_ADDR(0xF0, lane));
++		ufs_lld_pma_write(hba, 0xFF, PHY_PMA_TRSV_ADDR(0xF0, lane));
++	}
++	return UFS_CAL_ERROR;
++}
++
++static inline ufs_cal_errno __match_board_by_cfg(u8 board, u8 cfg_board)
++{
++	ufs_cal_errno match = UFS_CAL_ERROR;
++
++	if (cfg_board == 0)
++		match = UFS_CAL_NO_ERROR;
++	else if (board == cfg_board)
++		match = UFS_CAL_NO_ERROR;
++
++	return match;
++}
++
++static inline ufs_cal_errno __match_mode_by_cfg(struct uic_pwr_mode *pmd,
++								int mode)
++{
++	ufs_cal_errno match = UFS_CAL_ERROR;
++	u8 _m, _l, _g;
++
++	_m = pmd->mode;
++	_g = pmd->gear;
++	_l = pmd->lane;
++
++	if (mode == PMD_ALL)
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && mode == PMD_HS)
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && mode == PMD_PWM)
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && _g == 1 && _l == 1
++		&& (mode & (PMD_HS_G1_L1|PMD_HS_G1_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && _g == 1 && _l == 2
++		&& (mode & (PMD_HS_G1_L1|PMD_HS_G1_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && _g == 2 && _l == 1
++		&& (mode & (PMD_HS_G2_L1|PMD_HS_G2_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && _g == 2 && _l == 2
++		&& (mode & (PMD_HS_G2_L1|PMD_HS_G2_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && _g == 3 && _l == 1
++		&& (mode & (PMD_HS_G3_L1|PMD_HS_G3_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_HS(_m) && _g == 3 && _l == 2
++		&& (mode & (PMD_HS_G3_L1|PMD_HS_G3_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 1 && _l == 1
++		&& (mode & (PMD_PWM_G1_L1|PMD_PWM_G1_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 1 && _l == 2
++		&& (mode & (PMD_PWM_G1_L1|PMD_PWM_G1_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 2 && _l == 1
++		&& (mode & (PMD_PWM_G2_L1|PMD_PWM_G2_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 2 && _l == 2
++		&& (mode & (PMD_PWM_G2_L1|PMD_PWM_G2_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 3 && _l == 1
++		&& (mode & (PMD_PWM_G3_L1|PMD_PWM_G3_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 3 && _l == 2
++		&& (mode & (PMD_PWM_G3_L1|PMD_PWM_G3_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 4 && _l == 1
++		&& (mode & (PMD_PWM_G4_L1|PMD_PWM_G4_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 4 && _l == 2
++		&& (mode & (PMD_PWM_G4_L1|PMD_PWM_G4_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 5 && _l == 1
++		&& (mode & (PMD_PWM_G5_L1|PMD_PWM_G5_L2)))
++		match = UFS_CAL_NO_ERROR;
++	else if (IS_PWR_MODE_PWM(_m) && _g == 5 && _l == 2
++		&& (mode & (PMD_PWM_G5_L1|PMD_PWM_G5_L2)))
++		match = UFS_CAL_NO_ERROR;
++
++	return match;
++}
++
++static inline ufs_cal_errno ufs_cal_wait_pll_lock(void *hba,
++					u32 addr, u32 mask)
++{
++	u32 delay_us = 1;
++	u32 period_ms = 1;
++	u32 reg;
++	unsigned long timeout = ufs_lld_get_time_count(0) + ufs_cal_lock_timeout;
++
++	do {
++		reg = ufs_lld_pma_read(hba, PHY_PMA_COMN_ADDR(addr));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++		ufs_lld_usleep_delay(delay_us, delay_us);
++	} while ((long)(ufs_lld_get_time_count(period_ms) - timeout) >= 0);
++
++	return UFS_CAL_ERROR;
++}
++
++static inline ufs_cal_errno ufs_cal_wait_cdr_lock(void *hba,
++					u32 addr, u32 mask, int lane)
++{
++	u32 delay_us = 1;
++	u32 period_ms = 1;
++	u32 reg;
++	unsigned long timeout = ufs_lld_get_time_count(0) + ufs_cal_lock_timeout;
++
++	do {
++		reg = ufs_lld_pma_read(hba, PHY_PMA_TRSV_ADDR(addr, lane));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++		ufs_lld_usleep_delay(delay_us, delay_us);
++	} while ((long)(ufs_lld_get_time_count(period_ms) - timeout) >= 0);
++
++	return UFS_CAL_ERROR;
++
++}
++
++static ufs_cal_errno ufs_cal_config_uic(struct ufs_cal_param *p,
++				  const struct ufs_cal_phy_cfg *cfg,
++				  struct uic_pwr_mode *pmd)
++{
++	void *hba = p->host;
++	u8 i = 0;
++
++	if (!cfg)
++		return UFS_CAL_INV_ARG;
++
++	for_each_phy_cfg(cfg) {
++		for (i = 0; i < p->available_lane; i++) {
++			if (p->board && UFS_CAL_ERROR ==
++					__match_board_by_cfg(p->board, cfg->board))
++				continue;
++			if (pmd && UFS_CAL_ERROR ==
++					__match_mode_by_cfg(pmd, cfg->flg))
++				continue;
++
++			switch (cfg->lyr) {
++			case PHY_PCS_COMN:
++			case UNIPRO_STD_MIB:
++			case UNIPRO_DBG_MIB:
++				if (i == 0)
++					ufs_lld_dme_set(hba, UIC_ARG_MIB(cfg->addr),
++						cfg->val);
++				break;
++			case PHY_PCS_RXTX:
++				ufs_lld_dme_set(hba, UIC_ARG_MIB_SEL(cfg->addr, i),
++						cfg->val);
++				break;
++			case UNIPRO_DBG_PRD:
++				if (i == 0)
++					ufs_lld_dme_set(hba, UIC_ARG_MIB(cfg->addr),
++						UNIPRO_MCLK_PERIOD(p));
++				break;
++			case PHY_PCS_RX:
++				ufs_lld_dme_set(hba, UIC_ARG_MIB_SEL(cfg->addr,
++					RX_LANE_0+i), cfg->val);
++				break;
++			case PHY_PCS_TX:
++				ufs_lld_dme_set(hba, UIC_ARG_MIB_SEL(cfg->addr,
++					TX_LANE_0+i), cfg->val);
++				break;
++			case PHY_PCS_RX_PRD:
++				ufs_lld_dme_set(hba, UIC_ARG_MIB_SEL(cfg->addr,
++					RX_LANE_0+i), UNIPRO_MCLK_PERIOD(p));
++				break;
++
++			case PHY_PCS_TX_PRD:
++				ufs_lld_dme_set(hba, UIC_ARG_MIB_SEL(cfg->addr,
++					TX_LANE_0+i), UNIPRO_MCLK_PERIOD(p));
++				break;
++			case PHY_PMA_COMN:
++				if (i == 0)
++					ufs_lld_pma_write(hba, cfg->val,
++						PHY_PMA_COMN_ADDR(cfg->addr));
++				break;
++			case PHY_PMA_TRSV:
++				ufs_lld_pma_write(hba, cfg->val,
++						PHY_PMA_TRSV_ADDR(cfg->addr, i));
++				break;
++			case PHY_PMA_TRSV_LANE1_SQ_OFF:
++				if (i == 1) {
++					if (p->connected_rx_lane < p->available_lane)
++						ufs_lld_pma_write(hba, cfg->val,
++							PHY_PMA_TRSV_ADDR(cfg->addr, i));
++				}
++				break;
++			case UNIPRO_DBG_APB:
++				if (i == 1)
++					ufs_lld_unipro_write(hba, cfg->val, cfg->addr);
++				break;
++			case PHY_PLL_WAIT:
++				if (i == 0) {
++					if (ufs_cal_wait_pll_lock(hba,
++						cfg->addr, cfg->val) ==
++								UFS_CAL_ERROR)
++						return UFS_CAL_TIMEOUT;
++				}
++				break;
++			case PHY_CDR_WAIT:
++				if (ufs_cal_wait_cdr_lock(hba,
++						cfg->addr, cfg->val, i) ==
++								UFS_CAL_ERROR)
++					return UFS_CAL_TIMEOUT;
++				break;
++			case PHY_CDR_AFC_WAIT:
++				if (ufs_cal_wait_cdr_afc_check(hba,
++						cfg->addr, cfg->val, i) ==
++						UFS_CAL_ERROR)
++					return UFS_CAL_TIMEOUT;
++				break;
++			case COMMON_WAIT:
++				if (i == 0)
++					ufs_lld_udelay(cfg->val);
++				break;
++			default:
++				break;
++			}
++		}
++	}
++
++	return UFS_CAL_NO_ERROR;
++}
++
++/*
++ * This is a recommendation from Samsung UFS device vendor.
++ *
++ * Activate time: host < device
++ * Hibern time: host > device
++ */
++static void ufs_cal_calib_hibern8_values(void *hba)
++{
++	u32 hw_cap_min_tactivate;
++	u32 peer_rx_min_actv_time_cap;
++	u32 max_rx_hibern8_time_cap;
++
++	ufs_lld_dme_get(hba, UIC_ARG_MIB_SEL(0x8F, RX_LANE_0),
++			&hw_cap_min_tactivate);	/* HW Capability of MIN_TACTIVATE */
++
++	ufs_lld_dme_get(hba, UIC_ARG_MIB(0x15A8),
++			&peer_rx_min_actv_time_cap);	/* PA_TActivate */
++	ufs_lld_dme_get(hba, UIC_ARG_MIB(0x15A7),
++			&max_rx_hibern8_time_cap);	/* PA_Hibern8Time */
++
++	if (peer_rx_min_actv_time_cap >= hw_cap_min_tactivate)
++		ufs_lld_dme_peer_set(hba, UIC_ARG_MIB(0x15A8),
++				peer_rx_min_actv_time_cap + 1);
++	ufs_lld_dme_set(hba, UIC_ARG_MIB(0x15A7), max_rx_hibern8_time_cap + 1);
++}
++
++ufs_cal_errno ufs_cal_post_h8_enter(struct ufs_cal_param *p)
++{
++	ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++
++	ret = ufs_cal_config_uic(p, post_h8_enter, p->pmd);
++
++	return ret;
++}
++
++ufs_cal_errno ufs_cal_pre_h8_exit(struct ufs_cal_param *p)
++{
++	ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++
++	ret = ufs_cal_config_uic(p, pre_h8_exit, p->pmd);
++
++	return ret;
++}
++
++/*
++ * This currently uses only SLOW_MODE and FAST_MODE.
++ * If you want others, you should modify this function.
++ */
++ufs_cal_errno ufs_cal_pre_pmc(struct ufs_cal_param *p)
++{
++	ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	if ((p->pmd->mode == SLOW_MODE) || (p->pmd->mode == SLOWAUTO_MODE))
++		cfg = calib_of_pwm;
++	else if (p->pmd->hs_series == PA_HS_MODE_B)
++		cfg = calib_of_hs_rate_b;
++	else if (p->pmd->hs_series == PA_HS_MODE_A)
++		cfg = calib_of_hs_rate_a;
++	else
++		return UFS_CAL_INV_ARG;
++
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++
++	return ret;
++}
++
++/*
++ * This currently uses only SLOW_MODE and FAST_MODE.
++ * If you want others, you should modify this function.
++ */
++ufs_cal_errno ufs_cal_post_pmc(struct ufs_cal_param *p)
++{
++	ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	if ((p->pmd->mode == SLOWAUTO_MODE) || (p->pmd->mode == SLOW_MODE))
++		cfg = post_calib_of_pwm;
++	else if (p->pmd->hs_series == PA_HS_MODE_B)
++		cfg = post_calib_of_hs_rate_b;
++	else if (p->pmd->hs_series == PA_HS_MODE_A)
++		cfg = post_calib_of_hs_rate_a;
++	else
++		return UFS_CAL_INV_ARG;
++
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++
++	return ret;
++}
++
++ufs_cal_errno ufs_cal_post_link(struct ufs_cal_param *p)
++{
++	ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++
++	ufs_cal_calib_hibern8_values(p->host);
++
++	ret = ufs_cal_config_uic(p, post_init_cfg, NULL);
++
++	return ret;
++}
++
++ufs_cal_errno ufs_cal_pre_link(struct ufs_cal_param *p)
++{
++	ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++
++	ret = ufs_cal_config_uic(p, init_cfg, NULL);
++
++	return ret;
++}
++
++ufs_cal_errno ufs_cal_init(struct ufs_cal_param *p, int idx)
++{
++	/*
++	 * Return if innput index is greater than
++	 * the maximum that cal supports
++	 */
++	if (idx >= NUM_OF_UFS_HOST)
++		return UFS_CAL_INV_ARG;
++
++	ufs_cal[idx] = p;
++
++	ufs_cal_lock_timeout = ufs_lld_calc_timeout(100);
++
++	return UFS_CAL_NO_ERROR;
++}
+--- /dev/null
++++ b/drivers/ufs/host/ufs-cal-9610.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Samsung Exynos9610 calibration tables from the SM-P615 vendor kernel. */
++struct uic_pwr_mode {
++	u8 lane;
++	u8 gear;
++	u8 mode;
++	u8 hs_series;
++};
++
++struct ufs_cal_param {
++	void *host;		/* Host adaptor */
++	u8 available_lane;
++	u8 connected_tx_lane;
++	u8 connected_rx_lane;
++	u8 active_tx_lane;
++	u8 active_rx_lane;
++	u32 mclk_rate;
++	u8 board;
++	struct uic_pwr_mode *pmd;
++};
++
++typedef enum {
++	UFS_CAL_NO_ERROR = 0,
++	UFS_CAL_TIMEOUT,
++	UFS_CAL_ERROR,
++	UFS_CAL_INV_ARG,
++} ufs_cal_errno;
++
++enum {
++	__BRD_COMMON,
++	__BRD_UNIV,
++	__BRD_SMDK,
++	__BRD_ASB,
++	__BRD_ZEBU,
++};
++#define BRD_COMMON	(1U << __BRD_COMMON)
++#define BRD_SMDK	(1U << __BRD_SMDK)
++#define BRD_UNIV	(1U << __BRD_UNIV)
++#define BRD_ASB		(1U << __BRD_ASB)
++#define BRD_ZEBU	(1U << __BRD_ZEBU)
++
++/* UFS CAL interface */
++ufs_cal_errno ufs_cal_post_h8_enter(struct ufs_cal_param *p);
++ufs_cal_errno ufs_cal_pre_h8_exit(struct ufs_cal_param *p);
++ufs_cal_errno ufs_cal_post_pmc(struct ufs_cal_param *p);
++ufs_cal_errno ufs_cal_pre_pmc(struct ufs_cal_param *p);
++ufs_cal_errno ufs_cal_post_link(struct ufs_cal_param *p);
++ufs_cal_errno ufs_cal_pre_link(struct ufs_cal_param *p);
++ufs_cal_errno ufs_cal_init(struct ufs_cal_param *p, int idx);
++
++/* Adaptor for UFS CAL */
++void ufs_lld_dme_set(void *h, u32 addr, u32 val);
++void ufs_lld_dme_get(void *h, u32 addr, u32 *val);
++void ufs_lld_dme_peer_set(void *h, u32 addr, u32 val);
++void ufs_lld_pma_write(void *h, u32 val, u32 addr);
++u32 ufs_lld_pma_read(void *h, u32 addr);
++void ufs_lld_unipro_write(void *h, u32 val, u32 addr);
++void ufs_lld_udelay(u32 val);
++void ufs_lld_usleep_delay(u32 min, u32 max);
++unsigned long ufs_lld_get_time_count(unsigned long offset);
++unsigned long ufs_lld_calc_timeout(const unsigned int ms);

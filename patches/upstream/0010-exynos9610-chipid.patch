@@ -1,0 +1,26 @@
+Exynos9610's product ID is "0xE9610000". Add this ID to the IDs
+table along with the name of the SoC.
+
+Signed-off-by: Alexandru Chimac <alex@chimac.ro>
+---
+ drivers/soc/samsung/exynos-chipid.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/soc/samsung/exynos-chipid.c b/drivers/soc/samsung/exynos-chipid.c
+index c86f1058ceed7c40f89cf65cb7027382cae38829..a5ed1c105b8f5d08c7ea71515e0778ea17bec75f 100644
+--- a/drivers/soc/samsung/exynos-chipid.c
++++ b/drivers/soc/samsung/exynos-chipid.c
+@@ -62,6 +62,7 @@ static const struct exynos_soc_id {
+ 	{ "EXYNOS7885", 0xE7885000 },
+ 	{ "EXYNOS850", 0xE3830000 },
+ 	{ "EXYNOS8895", 0xE8895000 },
++	{ "EXYNOS9610", 0xE9610000 },
+ 	{ "EXYNOS9810", 0xE9810000 },
+ 	{ "EXYNOS990", 0xE9830000 },
+ 	{ "EXYNOSAUTOV9", 0xAAA80000 },
+
+-- 
+2.47.3
+
+
+

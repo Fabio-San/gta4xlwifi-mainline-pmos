@@ -1,0 +1,209 @@
+--- a/Documentation/devicetree/bindings/soc/samsung/exynos-usi.yaml
++++ b/Documentation/devicetree/bindings/soc/samsung/exynos-usi.yaml
+@@ -43,6 +43,7 @@
+       - enum:
+           - samsung,exynos850-usi
+           - samsung,exynos8895-usi
++          - samsung,exynos9610-usi
+ 
+   reg:
+     maxItems: 1
+@@ -110,16 +111,34 @@
+   - ranges
+   - "#address-cells"
+   - "#size-cells"
+-  - samsung,sysreg
+   - samsung,mode
+ 
+ allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: samsung,exynos9610-usi
++    then:
++      description: |
++        Exynos9610 dedicated SPI blocks use the USIv2 reset interface while
++        retaining firmware's SPI protocol selection. No external SW_CONF
++        register is managed by this interface.
++      properties:
++        samsung,mode:
++          const: 2
++        samsung,sysreg: false
++    else:
++      required:
++        - samsung,sysreg
++
+   - if:
+       properties:
+         compatible:
+           contains:
+             enum:
+               - samsung,exynos850-usi
++              - samsung,exynos9610-usi
+ 
+     then:
+       properties:
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -2,6 +2,7 @@
+ /* Diagnostic peripheral enablement. */
+ #include "exynos9610-gta4xl.dts"
+ #include <dt-bindings/clock/samsung,exynos9610-cmu.h>
++#include <dt-bindings/soc/samsung,exynos-usi.h>
+ 
+ / {
+ 	aliases {
+@@ -52,31 +53,43 @@
+ 			      "dout_cmu_peri_ip", "dout_cmu_peri_uart";
+ 	};
+ 
+-	touch_spi: spi@13900000 {
+-		compatible = "samsung,exynos9610-spi";
+-		reg = <0x13900000 0x100>;
+-		interrupts = <GIC_SPI 254 IRQ_TYPE_LEVEL_HIGH>;
++	touch_usi: usi@139000c0 {
++		compatible = "samsung,exynos9610-usi";
++		reg = <0x139000c0 0x20>;
++		samsung,mode = <USI_MODE_SPI>;
+ 		clocks = <&cmu_peri CLK_GOUT_PERI_SPI_0_PCLK>,
+ 			 <&cmu_peri CLK_GOUT_PERI_SPI_0_IPCLK>;
+-		clock-names = "spi", "spi_busclk0";
+-		pinctrl-names = "default";
+-		pinctrl-0 = <&spi6_bus &spi6_cs>;
+-		cs-gpios = <&gpp2 3 GPIO_ACTIVE_LOW>;
++		clock-names = "pclk", "ipclk";
+ 		#address-cells = <1>;
+-		#size-cells = <0>;
+-
+-		touchscreen@0 {
+-			compatible = "himax,hx83102e";
+-			reg = <0>;
+-			spi-max-frequency = <7000000>;
+-			spi-cpol;
+-			spi-cpha;
++		#size-cells = <1>;
++		ranges;
++
++		touch_spi: spi@13900000 {
++			compatible = "samsung,exynos9610-spi";
++			reg = <0x13900000 0xc0>;
++			interrupts = <GIC_SPI 254 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_peri CLK_GOUT_PERI_SPI_0_PCLK>,
++				 <&cmu_peri CLK_GOUT_PERI_SPI_0_IPCLK>;
++			clock-names = "spi", "spi_busclk0";
+ 			pinctrl-names = "default";
+-			pinctrl-0 = <&touch_irq>;
+-			interrupts-extended = <&gpa0 0 IRQ_TYPE_EDGE_FALLING>;
+-			reset-gpios = <&gpg1 4 GPIO_ACTIVE_LOW>;
+-			touchscreen-size-x = <1200>;
+-			touchscreen-size-y = <2000>;
++			pinctrl-0 = <&spi6_bus &spi6_cs>;
++			cs-gpios = <&gpp2 3 GPIO_ACTIVE_LOW>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			touchscreen@0 {
++				compatible = "himax,hx83102e";
++				reg = <0>;
++				spi-max-frequency = <7000000>;
++				spi-cpol;
++				spi-cpha;
++				pinctrl-names = "default";
++				pinctrl-0 = <&touch_irq>;
++				interrupts-extended = <&gpa0 0 IRQ_TYPE_EDGE_FALLING>;
++				reset-gpios = <&gpg1 4 GPIO_ACTIVE_LOW>;
++				touchscreen-size-x = <1200>;
++				touchscreen-size-y = <2000>;
++			};
+ 		};
+ 	};
+ 
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-sd.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-sd.dts
+@@ -14,7 +14,7 @@
+ 	status = "disabled";
+ };
+ 
+-&touch_spi {
++&touch_usi {
+ 	status = "disabled";
+ };
+ 
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-usb.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-usb.dts
+@@ -22,7 +22,7 @@
+ 	status = "disabled";
+ };
+ 
+-&touch_spi {
++&touch_usi {
+ 	status = "disabled";
+ };
+ 
+--- a/drivers/soc/samsung/exynos-usi.c
++++ b/drivers/soc/samsung/exynos-usi.c
+@@ -53,7 +53,7 @@
+ 
+ struct exynos_usi_variant {
+ 	enum exynos_usi_ver ver;	/* USI IP-core version */
+-	unsigned int sw_conf_mask;	/* SW_CONF mask for all protocols */
++	unsigned int sw_conf_mask;	/* SW_CONF mask; zero preserves fixed protocol */
+ 	size_t min_mode;		/* first index in exynos_usi_modes[] */
+ 	size_t max_mode;		/* last index in exynos_usi_modes[] */
+ 	size_t num_clks;		/* number of clocks to assert */
+@@ -117,7 +117,20 @@
+ 	.clk_names	= exynos850_usi_clk_names,
+ };
+ 
++/* Dedicated SPI instances retain their firmware-selected protocol. */
++static const struct exynos_usi_variant exynos9610_usi_data = {
++	.ver		= USI_VER2,
++	.min_mode	= USI_MODE_SPI,
++	.max_mode	= USI_MODE_SPI,
++	.num_clks	= ARRAY_SIZE(exynos850_usi_clk_names),
++	.clk_names	= exynos850_usi_clk_names,
++};
++
+ static const struct of_device_id exynos_usi_dt_match[] = {
++	{
++		.compatible = "samsung,exynos9610-usi",
++		.data = &exynos9610_usi_data,
++	},
+ 	{
+ 		.compatible = "samsung,exynos850-usi",
+ 		.data = &exynos850_usi_data,
+@@ -147,10 +160,12 @@
+ 		return -EINVAL;
+ 
+ 	val = exynos_usi_modes[usi->data->ver][mode].val;
+-	ret = regmap_update_bits(usi->sysreg, usi->sw_conf,
+-				 usi->data->sw_conf_mask, val);
+-	if (ret)
+-		return ret;
++	if (usi->data->sw_conf_mask) {
++		ret = regmap_update_bits(usi->sysreg, usi->sw_conf,
++					 usi->data->sw_conf_mask, val);
++		if (ret)
++			return ret;
++	}
+ 
+ 	usi->mode = mode;
+ 	dev_dbg(usi->dev, "protocol: %s\n",
+@@ -256,10 +271,12 @@
+ 		return -EINVAL;
+ 	usi->mode = mode;
+ 
+-	usi->sysreg = syscon_regmap_lookup_by_phandle_args(np, "samsung,sysreg",
+-							   1, &usi->sw_conf);
+-	if (IS_ERR(usi->sysreg))
+-		return PTR_ERR(usi->sysreg);
++	if (usi->data->sw_conf_mask) {
++		usi->sysreg = syscon_regmap_lookup_by_phandle_args(np, "samsung,sysreg",
++								   1, &usi->sw_conf);
++		if (IS_ERR(usi->sysreg))
++			return PTR_ERR(usi->sysreg);
++	}
+ 
+ 	usi->clkreq_on = of_property_read_bool(np, "samsung,clkreq-on");
+ 

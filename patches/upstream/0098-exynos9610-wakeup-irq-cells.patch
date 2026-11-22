@@ -1,0 +1,29 @@
+--- a/arch/arm64/boot/dts/exynos/exynos9610-pinctrl.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos9610-pinctrl.dtsi
+@@ -23,7 +23,7 @@
+ 		#gpio-cells = <2>;
+ 
+ 		interrupt-controller;
+-		#interrupt-cells = <3>;
++		#interrupt-cells = <2>;
+ 		interrupt-parent = <&gic>;
+ 		interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH>,
+@@ -40,7 +40,7 @@
+ 		#gpio-cells = <2>;
+ 
+ 		interrupt-controller;
+-		#interrupt-cells = <3>;
++		#interrupt-cells = <2>;
+ 		interrupt-parent = <&gic>;
+ 		interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>,
+@@ -57,7 +57,7 @@
+ 		#gpio-cells = <2>;
+ 
+ 		interrupt-controller;
+-		#interrupt-cells = <3>;
++		#interrupt-cells = <2>;
+ 		interrupt-parent = <&gic>;
+ 		interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>,

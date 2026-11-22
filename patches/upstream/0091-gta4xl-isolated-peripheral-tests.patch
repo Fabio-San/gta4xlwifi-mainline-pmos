@@ -1,0 +1,68 @@
+--- a/arch/arm64/boot/dts/exynos/Makefile
++++ b/arch/arm64/boot/dts/exynos/Makefile
+@@ -26,3 +26,4 @@
+ 	exynosautov920-sadk.dtb
+ 
+ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9610-gta4xl-peripherals.dtb
++dtb-$(CONFIG_ARCH_EXYNOS) += exynos9610-gta4xl-usb.dtb exynos9610-gta4xl-sd.dtb
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -6,7 +6,7 @@
+ &soc {
+ 	cmu_top: clock-controller@12100000 {
+ 		compatible = "samsung,exynos9610-cmu-top";
+-		reg = <0x12100000 0x8000>;
++		reg = <0x12100000 0x10000>;
+ 		#clock-cells = <1>;
+ 		clocks = <&oscclk>;
+ 		clock-names = "oscclk";
+@@ -14,7 +14,7 @@
+ 
+ 	cmu_usb: clock-controller@13030000 {
+ 		compatible = "samsung,exynos9610-cmu-usb";
+-		reg = <0x13030000 0x8000>;
++		reg = <0x13030000 0x10000>;
+ 		#clock-cells = <1>;
+ 		clocks = <&oscclk>, <&cmu_top CLK_DOUT_CMU_USB_BUS>,
+ 			 <&cmu_top CLK_DOUT_CMU_USB_DPGTC>,
+@@ -51,7 +51,7 @@
+ 
+ 	cmu_fsys: clock-controller@13400000 {
+ 		compatible = "samsung,exynos9610-cmu-fsys";
+-		reg = <0x13400000 0x8000>;
++		reg = <0x13400000 0x10000>;
+ 		#clock-cells = <1>;
+ 		clocks = <&oscclk>, <&cmu_top CLK_DOUT_CMU_FSYS_BUS>,
+ 			 <&cmu_top CLK_DOUT_CMU_FSYS_MMC_CARD>,
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-usb.dts
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Isolate USB bring-up from the SD host and its clock domain. */
++#include "exynos9610-gta4xl-peripherals.dts"
++
++&mmc {
++	status = "disabled";
++};
++
++&cmu_fsys {
++	status = "disabled";
++};
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-sd.dts
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Isolate SD bring-up from the USB controller and PHY. */
++#include "exynos9610-gta4xl-peripherals.dts"
++
++&usb {
++	status = "disabled";
++};
++
++&usbdrd_phy {
++	status = "disabled";
++};
++
++&cmu_usb {
++	status = "disabled";
++};

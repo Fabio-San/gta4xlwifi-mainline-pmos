@@ -1,0 +1,18 @@
+From: gta4xl Linux bring-up <linux@gta4xl.local>
+Subject: [PATCH] mm: allow selecting built-in zsmalloc for modular zram
+
+The gta4xl configuration builds zram as a module and its allocator into the
+kernel. Give ZSMALLOC a prompt so Kconfig honors CONFIG_ZSMALLOC=y from the
+configuration fragment rather than reducing it to zram's selected value m.
+
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -123,7 +123,7 @@ config ZSWAP_COMPRESSOR_DEFAULT
+        default ""
+ 
+ config ZSMALLOC
+-	tristate
++	tristate "Zsmalloc allocator"
+ 
+ menu "Zsmalloc allocator options"
+ 	depends on ZSMALLOC

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SSH Server
+Name[it]=Server SSH
+Comment=Enable or disable the SSH server
+Comment[it]=Attiva o disattiva il server SSH
+Exec=/usr/local/bin/ssh-toggle.sh
+Icon=network-workgroup
+Terminal=false
+Categories=System;Settings;
+StartupNotify=true

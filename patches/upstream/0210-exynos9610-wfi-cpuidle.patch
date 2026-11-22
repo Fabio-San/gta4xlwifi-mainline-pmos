@@ -1,0 +1,89 @@
+From: gta4xl Linux port
+Subject: [PATCH] cpuidle: add architectural WFI accounting for Exynos9610
+
+Expose the architectural WFI sequence already used by arch_cpu_idle()
+through cpuidle. Keep the local timer running and retain CPU/GIC context.
+There are no MMIO writes or firmware suspend calls in this driver.
+
+The downstream C2 state requires Exynos core/cluster PMUCAL preparation
+and resume hooks absent from this port. Do not advertise it as a generic
+PSCI power-down state. A single non-polling WFI state lets the menu
+governor stop the scheduler tick with CONFIG_NO_HZ_IDLE.
+
+---
+
+diff --git a/drivers/cpuidle/Kconfig.arm b/drivers/cpuidle/Kconfig.arm
+--- a/drivers/cpuidle/Kconfig.arm
++++ b/drivers/cpuidle/Kconfig.arm
+@@ -94,6 +94,16 @@
+ 	help
+ 	  Select this to enable cpuidle for AT91 processors.
+ 
++config ARM_EXYNOS9610_CPUIDLE
++	bool "WFI idle driver for Exynos9610/9611"
++	depends on ARM64 && ARCH_EXYNOS
++	depends on !ARM_PSCI_CPUIDLE
++	help
++	  Register architectural WFI with the CPU idle framework on Exynos9610
++	  and Exynos9611. This preserves the architectural idle sequence and
++	  allows idle-state accounting with tickless idle. It does not enable
++	  the Samsung-specific core or cluster power-down sequences.
++
+ config ARM_EXYNOS_CPUIDLE
+ 	bool "Cpu Idle Driver for the Exynos processors"
+ 	depends on (ARCH_EXYNOS || COMPILE_TEST) && !ARM64
+diff --git a/drivers/cpuidle/Makefile b/drivers/cpuidle/Makefile
+--- a/drivers/cpuidle/Makefile
++++ b/drivers/cpuidle/Makefile
+@@ -24,6 +24,7 @@
+ obj-$(CONFIG_ARM_U8500_CPUIDLE)         += cpuidle-ux500.o
+ obj-$(CONFIG_ARM_AT91_CPUIDLE)          += cpuidle-at91.o
+ obj-$(CONFIG_ARM_EXYNOS_CPUIDLE)        += cpuidle-exynos.o
++obj-$(CONFIG_ARM_EXYNOS9610_CPUIDLE)    += cpuidle-exynos9610.o
+ obj-$(CONFIG_ARM_CPUIDLE)		+= cpuidle-arm.o
+ obj-$(CONFIG_ARM_PSCI_CPUIDLE)		+= cpuidle-psci.o
+ obj-$(CONFIG_ARM_PSCI_CPUIDLE_DOMAIN)	+= cpuidle-psci-domain.o
+diff --git a/drivers/cpuidle/cpuidle-exynos9610.c b/drivers/cpuidle/cpuidle-exynos9610.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/cpuidle/cpuidle-exynos9610.c
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Architectural WFI accounting for the Exynos9610/9611 upstream port. */
++#include <linux/cpuidle.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/of.h>
++
++#include <asm/cpuidle.h>
++
++static __cpuidle int exynos9610_enter_wfi(struct cpuidle_device *dev,
++				struct cpuidle_driver *drv, int index)
++{
++	/* Keep the local timer and interrupt controller powered for wakeup. */
++	cpu_do_idle();
++
++	return index;
++}
++
++static struct cpuidle_driver exynos9610_idle_driver = {
++	.name = "exynos9610_wfi",
++	.owner = THIS_MODULE,
++	.states[0] = {
++		.enter = exynos9610_enter_wfi,
++		.exit_latency = 1,
++		.target_residency = 1,
++		.name = "WFI",
++		.desc = "ARM WFI",
++	},
++	.state_count = 1,
++};
++
++static int __init exynos9610_idle_init(void)
++{
++	if (!of_machine_is_compatible("samsung,exynos9610"))
++		return -ENODEV;
++
++	return cpuidle_register(&exynos9610_idle_driver, NULL);
++}
++device_initcall(exynos9610_idle_init);

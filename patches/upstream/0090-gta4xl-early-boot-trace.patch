@@ -1,0 +1,59 @@
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -82,7 +82,35 @@
+ 	 *  x20        primary_entry() .. __primary_switch()    CPU boot mode
+ 	 *  x21        primary_entry() .. start_kernel()        FDT pointer passed at boot in x0
+ 	 */
++#ifdef CONFIG_GTA4XL_EARLY_TRACE
++	/* Diagnostic only: a standard persistent-RAM pmsg header and 16-byte tag.
++	 * This is the SM-P615's reserved pmsg area, never ordinary allocator RAM.
++	 * Use only scratch registers and aligned stores while the MMU is off.
++	 */
++	.macro gta4xl_boot_trace step
++	mov_q	x9, 0xf9e90000
++	mov_q	x10, 0x34415447
++	str	w10, [x9, #12]
++	mov_q	x10, 0x532d4c58
++	str	w10, [x9, #16]
++	mov_q	x10, 0x45474154
++	str	w10, [x9, #20]
++	mov_q	x10, (0x0a30302d + (\step << 16))
++	str	w10, [x9, #24]
++	mov_q	x10, 0x43474244
++	str	w10, [x9]
++	mov	w10, #16
++	str	w10, [x9, #4]
++	str	w10, [x9, #8]
++	dsb	sy
++	.endm
++#else
++	.macro gta4xl_boot_trace step
++	.endm
++#endif
++
+ SYM_CODE_START(primary_entry)
++	gta4xl_boot_trace 0
+ 	bl	record_mmu_state
+ 	bl	preserve_boot_args
+ 
+@@ -127,6 +155,7 @@
+ 	 * the TCR will have been set.
+ 	 */
+ 	bl	__cpu_setup			// initialise processor
++	gta4xl_boot_trace 1
+ 	b	__primary_switch
+ SYM_CODE_END(primary_entry)
+ 
+--- a/arch/arm64/Kconfig.platforms
++++ b/arch/arm64/Kconfig.platforms
+@@ -466,3 +466,10 @@
+ 	  This enables support for Xilinx ZynqMP Family
+ 
+ endmenu # "Platform selection"
++
++config GTA4XL_EARLY_TRACE
++	bool "SM-P615 early boot stage markers (bring-up only)"
++	depends on ARCH_EXYNOS && EXPERT
++	help
++	  Write pre-MMU diagnostic markers into the SM-P615 reserved pmsg RAM.
++	  Only enable for this tablet with the matching reserved-memory layout.

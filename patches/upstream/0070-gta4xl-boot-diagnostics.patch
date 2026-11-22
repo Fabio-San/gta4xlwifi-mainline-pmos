@@ -1,0 +1,52 @@
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl.dts
+@@ -12,6 +12,7 @@
+ #include <dt-bindings/input/input.h>
+ 
+ / {
++	model = "Samsung Galaxy Tab S6 Lite LTE (SM-P615) upstream bring-up";
+ 	compatible = "samsung,gta4xl", "samsung,exynos9610";
+ 	#address-cells = <2>;
+ 	#size-cells = <1>;
+@@ -23,6 +24,7 @@
+ 
+ 		framebuffer0: framebuffer@ca000000 {
+ 			compatible = "simple-framebuffer";
++			reg = <0x0 0xca000000 (1200 * 2000 * 4)>;
+ 			memory-region = <&cont_splash_rmem>;
+ 			width = <1200>;
+ 			height = <2000>;
+@@ -95,3 +97,33 @@
+ 		samsung,pin-drv = <EXYNOS5420_PIN_DRV_LV1>;
+ 	};
+ };
++
++/* Reuse the downstream PMU reset register through the upstream syscon driver. */
++&soc {
++	pmu: syscon@11860000 {
++		compatible = "syscon";
++		reg = <0x11860000 0x10000>;
++	};
++};
++
++/ {
++	reboot {
++		compatible = "syscon-reboot";
++		regmap = <&pmu>;
++		offset = <0x400>;
++		mask = <1>;
++	};
++};
++
++/* The firmware/bridge leaves the little-cluster watchdog running. */
++&soc {
++	watchdog@10050000 {
++		compatible = "samsung,exynos7-wdt";
++		reg = <0x10050000 0x100>;
++		interrupts = <GIC_SPI 232 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&oscclk>;
++		clock-names = "watchdog";
++		samsung,syscon-phandle = <&pmu>;
++		timeout-sec = <60>;
++	};
++};

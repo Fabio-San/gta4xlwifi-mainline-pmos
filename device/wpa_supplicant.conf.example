@@ -1,0 +1,13 @@
+# WiFi configuration template (NO credentials included).
+# Copy to /etc/wpa_supplicant/wpa_supplicant.conf and add your own network.
+# The sterile ROM ships this EMPTY template only.
+
+ctrl_interface=DIR=/run/wpa_supplicant GROUP=netdev
+update_config=1
+country=IT
+
+# network={
+#     ssid="YOUR_NETWORK_NAME"
+#     psk="YOUR_PASSWORD"
+#     key_mgmt=WPA-PSK
+# }

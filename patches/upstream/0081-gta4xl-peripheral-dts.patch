@@ -1,0 +1,98 @@
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Diagnostic peripheral enablement; supplies retain the bootloader state. */
++#include "exynos9610-gta4xl.dts"
++#include <dt-bindings/clock/samsung,exynos9610-cmu.h>
++
++&soc {
++	cmu_top: clock-controller@12100000 {
++		compatible = "samsung,exynos9610-cmu-top";
++		reg = <0x12100000 0x8000>;
++		#clock-cells = <1>;
++		clocks = <&oscclk>;
++		clock-names = "oscclk";
++	};
++
++	cmu_usb: clock-controller@13030000 {
++		compatible = "samsung,exynos9610-cmu-usb";
++		reg = <0x13030000 0x8000>;
++		#clock-cells = <1>;
++		clocks = <&oscclk>, <&cmu_top CLK_DOUT_CMU_USB_BUS>,
++			 <&cmu_top CLK_DOUT_CMU_USB_DPGTC>,
++			 <&cmu_top CLK_DOUT_CMU_USB_USB30DRD>;
++		clock-names = "oscclk", "dout_cmu_usb_bus",
++			      "dout_cmu_usb_dpgtc", "dout_cmu_usb_usb30drd";
++	};
++
++	usbdrd_phy: phy@131d0000 {
++		compatible = "samsung,exynos9610-usbdrd-phy";
++		reg = <0x131d0000 0x200>;
++		#phy-cells = <1>;
++		clocks = <&cmu_usb CLK_GOUT_USB_USB30DRD_BUS_CLK_EARLY>,
++			 <&cmu_usb CLK_GOUT_USB_USB30DRD_ACLK_PHYCTRL_20>,
++			 <&cmu_usb CLK_GOUT_USB_USB30DRD_REF_CLK>, <&oscclk>;
++		clock-names = "phy", "phy_ctrl", "phy_ref", "ref";
++		samsung,pmu-syscon = <&pmu>;
++	};
++
++	usb: usb@13200000 {
++		compatible = "snps,dwc3";
++		reg = <0x13200000 0x10000>;
++		interrupts = <GIC_SPI 186 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&cmu_usb CLK_GOUT_USB_USB30DRD_BUS_CLK_EARLY>,
++			 <&oscclk>, <&cmu_usb CLK_GOUT_USB_USB30DRD_REF_CLK>;
++		clock-names = "bus_early", "ref", "suspend";
++		phys = <&usbdrd_phy 0>;
++		phy-names = "usb2-phy";
++		dr_mode = "peripheral";
++		maximum-speed = "high-speed";
++		snps,dis-u2-freeclk-exists-quirk;
++		snps,dis_u2_susphy_quirk;
++	};
++
++	cmu_fsys: clock-controller@13400000 {
++		compatible = "samsung,exynos9610-cmu-fsys";
++		reg = <0x13400000 0x8000>;
++		#clock-cells = <1>;
++		clocks = <&oscclk>, <&cmu_top CLK_DOUT_CMU_FSYS_BUS>,
++			 <&cmu_top CLK_DOUT_CMU_FSYS_MMC_CARD>,
++			 <&cmu_top CLK_DOUT_CMU_FSYS_MMC_EMBD>,
++			 <&cmu_top CLK_DOUT_CMU_FSYS_UFS_EMBD>;
++		clock-names = "oscclk", "dout_cmu_fsys_bus",
++			      "dout_cmu_fsys_mmc_card", "dout_cmu_fsys_mmc_embd",
++			      "dout_cmu_fsys_ufs_embd";
++	};
++
++	/* Start at 3.3 V / 25 MHz; high-speed tuning and PMIC control follow. */
++	mmc: mmc@13550000 {
++		compatible = "samsung,exynos7-dw-mshc";
++		reg = <0x13550000 0x2000>;
++		interrupts = <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&cmu_fsys CLK_GOUT_FSYS_MMC_CARD_ACLK>,
++			 <&cmu_fsys CLK_GOUT_FSYS_MMC_CARD_SDCLKIN>;
++		clock-names = "biu", "ciu";
++		pinctrl-names = "default";
++		pinctrl-0 = <&sd2_clk &sd2_cmd &sd2_bus1 &sd2_bus4>;
++		bus-width = <4>;
++		fifo-depth = <0x40>;
++		broken-cd;
++		disable-wp;
++		no-1-8-v;
++		no-mmc;
++		no-sdio;
++		max-frequency = <25000000>;
++		samsung,dw-mshc-ciu-div = <3>;
++		samsung,dw-mshc-sdr-timing = <3 0>;
++		samsung,dw-mshc-ddr-timing = <3 0>;
++	};
++};
+--- a/arch/arm64/boot/dts/exynos/Makefile
++++ b/arch/arm64/boot/dts/exynos/Makefile
+@@ -24,3 +24,5 @@
+ 	exynos990-x1slte.dtb		\
+ 	exynosautov9-sadk.dtb		\
+ 	exynosautov920-sadk.dtb
++
++dtb-$(CONFIG_ARCH_EXYNOS) += exynos9610-gta4xl-peripherals.dtb

@@ -1,0 +1,138 @@
+--- a/drivers/phy/samsung/phy-exynos5-usbdrd.c
++++ b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+@@ -1624,6 +1624,50 @@
+ 		exynos5_usbdrd_usb_v3p1_pipe_override(phy_drd);
+ }
+ 
++/*
++ * Exynos9610 uses the v3.0 HS block at 0x131d0000. Unlike Exynos850,
++ * its USB device PHY and TCXO buffer share PMU offset 0x704. The tablet
++ * routes USB 2.0 only; the separate SuperSpeed block is left isolated.
++ */
++static void exynos9610_usbdrd_phy_isol(struct phy_usb_instance *inst,
++				     bool isolate)
++{
++	u32 mask = BIT(0) | BIT(1) | BIT(16);
++
++	regmap_update_bits(inst->reg_pmu, inst->pmu_offset,
++			   mask, isolate ? 0 : mask);
++}
++
++static void exynos9610_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
++{
++	void __iomem *regs = phy_drd->reg_phy;
++	u32 reg;
++
++	/* De-isolate before touching the PHY, matching the downstream order. */
++	exynos9610_usbdrd_phy_isol(&phy_drd->phys[EXYNOS5_DRDPHY_UTMI], false);
++
++	/* v3.0 Q-channel workaround from Samsung's calibration driver. */
++	reg = readl(regs + EXYNOS850_DRD_LINKCTRL);
++	reg |= BIT(9) | BIT(10) | BIT(11) | BIT(12);
++	reg &= ~LINKCTRL_FORCE_QACT;
++	udelay(500);
++	writel(reg, regs + EXYNOS850_DRD_LINKCTRL);
++	udelay(500);
++	writel(reg | LINKCTRL_FORCE_QACT, regs + EXYNOS850_DRD_LINKCTRL);
++
++	reg = readl(regs + EXYNOS850_DRD_CLKRST);
++	writel(reg | CLKRST_LINK_SW_RST, regs + EXYNOS850_DRD_CLKRST);
++	udelay(10);
++	writel(reg & ~CLKRST_LINK_SW_RST, regs + EXYNOS850_DRD_CLKRST);
++
++	exynos850_usbdrd_utmi_init(phy_drd);
++
++	/* Internal over-current inputs are used when the external pad is absent. */
++	reg = readl(regs + EXYNOS850_DRD_LINKPORT);
++	reg |= BIT(2) | BIT(3);
++	writel(reg, regs + EXYNOS850_DRD_LINKPORT);
++}
++
+ static int exynos850_usbdrd_phy_init(struct phy *phy)
+ {
+ 	struct phy_usb_instance *inst = phy_get_drvdata(phy);
+@@ -1939,6 +1983,14 @@
+ 		.id		= EXYNOS5_DRDPHY_UTMI,
+ 		.phy_isol	= exynos7870_usbdrd_phy_isol,
+ 		.phy_init	= exynos7870_usbdrd_utmi_init,
++	},
++};
++
++static const struct exynos5_usbdrd_phy_config phy_cfg_exynos9610[] = {
++	{
++		.id = EXYNOS5_DRDPHY_UTMI,
++		.phy_isol = exynos9610_usbdrd_phy_isol,
++		.phy_init = exynos9610_usbdrd_utmi_init,
+ 	},
+ };
+ 
+@@ -2077,6 +2129,21 @@
+ 	.n_core_clks		= ARRAY_SIZE(exynos5_core_clk_names),
+ 	.regulator_names	= exynos5_regulator_names,
+ 	.n_regulators		= ARRAY_SIZE(exynos5_regulator_names),
++};
++
++static const char * const exynos9610_clk_names[] = {
++	"phy", "phy_ctrl", "phy_ref",
++};
++
++static const struct exynos5_usbdrd_phy_drvdata exynos9610_usbdrd_phy = {
++	.phy_cfg = phy_cfg_exynos9610,
++	.phy_ops = &exynos850_usbdrd_phy_ops,
++	.pmu_offset_usbdrd0_phy = 0x704,
++	.clk_names = exynos9610_clk_names,
++	.n_clks = ARRAY_SIZE(exynos9610_clk_names),
++	.core_clk_names = exynos5_core_clk_names,
++	.n_core_clks = ARRAY_SIZE(exynos5_core_clk_names),
++	/* Board supplies are retained from firmware during initial bring-up. */
+ };
+ 
+ static const struct exynos5_usbdrd_phy_tuning exynos990_tunes_utmi_postinit[] = {
+@@ -2901,6 +2968,9 @@
+ 		.compatible = "samsung,exynos850-usbdrd-phy",
+ 		.data = &exynos850_usbdrd_phy
+ 	}, {
++		.compatible = "samsung,exynos9610-usbdrd-phy",
++		.data = &exynos9610_usbdrd_phy
++	}, {
+ 		.compatible = "samsung,exynos990-usbdrd-phy",
+ 		.data = &exynos990_usbdrd_phy
+ 	}, {
+--- a/Documentation/devicetree/bindings/phy/samsung,usb3-drd-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/samsung,usb3-drd-phy.yaml
+@@ -33,6 +33,7 @@
+       - samsung,exynos7-usbdrd-phy
+       - samsung,exynos7870-usbdrd-phy
+       - samsung,exynos850-usbdrd-phy
++      - samsung,exynos9610-usbdrd-phy
+       - samsung,exynos990-usbdrd-phy
+       - samsung,exynosautov920-usb31drd-combo-ssphy
+       - samsung,exynosautov920-usbdrd-combo-hsphy
+@@ -138,6 +139,27 @@
+       properties:
+         compatible:
+           contains:
++            const: samsung,exynos9610-usbdrd-phy
++    then:
++      properties:
++        clocks:
++          minItems: 4
++          maxItems: 4
++        clock-names:
++          items:
++            - const: phy
++            - const: phy_ctrl
++            - const: phy_ref
++            - const: ref
++        reg:
++          maxItems: 1
++        reg-names:
++          maxItems: 1
++
++  - if:
++      properties:
++        compatible:
++          contains:
+             const: google,gs101-usb31drd-phy
+     then:
+       allOf:

@@ -1,0 +1,555 @@
+From: gta4xl Linux port
+Subject: [PATCH] arm64: exynos9611: add firmware Panfrost DVFS and cooling
+
+Expose ACPM domain 4 with seven calibrated OPPs from 260 to 683 MHz.
+Keep voltage, PLL, mux and divider writes in Samsung firmware. Validate
+its live table before clock publication and read the hardware clock after
+each request. Retain the physical gate as the clock parent.
+
+Use frequency-only Panfrost OPPs without a Linux-controlled regulator.
+Require cooling registration for the firmware-managed variant, with
+staged caps at 60/70/78/85 C. Preserve critical and hardware trips.
+Exclude the firmware's higher characterization points. Account for the
+firmware's rounded PLL names and zero-status replies, and verify physical
+clock readback after Panfrost transitions.
+
+---
+
+diff --git a/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml b/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
+--- a/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
++++ b/Documentation/devicetree/bindings/firmware/samsung,exynos9610-acpm-ipc.yaml
+@@ -32,15 +32,19 @@
+ 
+   samsung,thermal:
+     $ref: /schemas/types.yaml#/definitions/phandle
+-    description: Calibrated TMU that must bind before CPU clocks are exposed.
++    description: Calibrated TMU that must bind before CPU/GPU clocks are exposed.
+ 
+   clocks:
+-    maxItems: 2
++    minItems: 2
++    maxItems: 4
+ 
+   clock-names:
++    minItems: 2
+     items:
+       - const: cpucl0-switch
+       - const: cpucl1-switch
++      - const: g3d-switch
++      - const: g3d-gate
+ 
+   pmic:
+     $ref: /schemas/regulator/samsung,s2mpu09.yaml#
+diff --git a/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml b/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
+@@ -30,6 +30,7 @@
+               - renesas,r9a09g047-mali
+               - renesas,r9a09g056-mali
+               - renesas,r9a09g057-mali
++              - samsung,exynos9611-mali
+               - rockchip,px30-mali
+               - rockchip,rk3562-mali
+               - rockchip,rk3568-mali
+diff --git a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -15,20 +15,6 @@
+ 		#clock-cells = <0>;
+ 		clock-frequency = <208011000>;
+ 		clock-output-names = "dll_dco";
+-	};
+-
+-	/*
+-	 * The bootloader leaves the GPU rail enabled; upstream does not yet
+-	 * drive the S2MPU09 GPU buck through ACPM. This fixed supply only
+-	 * satisfies the Panfrost regulator lookup.
+-	 */
+-	vdd_g3d: regulator-vdd-g3d {
+-		compatible = "regulator-fixed";
+-		regulator-name = "vdd_g3d";
+-		regulator-min-microvolt = <800000>;
+-		regulator-max-microvolt = <800000>;
+-		regulator-always-on;
+-		regulator-boot-on;
+ 	};
+ 
+ 	acpm: power-management {
+@@ -39,8 +25,11 @@
+ 		samsung,enable-dvfs;
+ 		samsung,thermal = <&cpu_tmu>;
+ 		clocks = <&cmu_top CLK_DOUT_CMU_CPUCL0_SWITCH>,
+-			 <&cmu_top CLK_DOUT_CMU_CPUCL1_SWITCH>;
+-		clock-names = "cpucl0-switch", "cpucl1-switch";
++			 <&cmu_top CLK_DOUT_CMU_CPUCL1_SWITCH>,
++			 <&cmu_top CLK_DOUT_CMU_G3D_SWITCH>,
++			 <&cmu_g3d CLK_GOUT_CLK_G3D_G3D_CLK>;
++		clock-names = "cpucl0-switch", "cpucl1-switch",
++			      "g3d-switch", "g3d-gate";
+ 
+ 		pmic {
+ 			compatible = "samsung,s2mpu09-pmic";
+@@ -226,18 +215,20 @@
+ 	};
+ 
+ 	gpu: gpu@11500000 {
+-		compatible = "arm,mali-bifrost";
++		compatible = "samsung,exynos9611-mali", "arm,mali-bifrost";
+ 		reg = <0x11500000 0x5000>;
+ 		interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
+ 		interrupt-names = "job", "mmu", "gpu";
+-		clocks = <&cmu_g3d CLK_GOUT_CLK_G3D_G3D_CLK>,
++		clocks = <&acpm 4>,
+ 			 <&cmu_g3d CLK_GOUT_G3D_BUSP_CLK>,
+ 			 <&cmu_g3d CLK_GOUT_G3D_BUSD_CLK>;
+ 		clock-names = "core", "bus", "bus_ace";
+ 		power-domains = <&pd_g3d>;
+-		mali-supply = <&vdd_g3d>;
++		/* ACPM sequences BUCK5 voltage with each clock transition. */
++		operating-points-v2 = <&gpu_opp_table>;
++		#cooling-cells = <2>;
+ 	};
+ 
+ 	cmu_usb: clock-controller@13030000 {
+@@ -702,10 +693,49 @@
+ 			thermal-sensors = <&cpu_tmu 0>;
+ 
+ 			trips {
++				gpu_throttle0: throttle-0 {
++					temperature = <60000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				gpu_throttle1: throttle-1 {
++					temperature = <70000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				gpu_throttle2: throttle-2 {
++					temperature = <78000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				gpu_throttle3: throttle-3 {
++					temperature = <85000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
+ 				critical {
+ 					temperature = <105000>;
+ 					hysteresis = <5000>;
+ 					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&gpu_throttle0>;
++					cooling-device = <&gpu 1 1>;
++				};
++				map1 {
++					trip = <&gpu_throttle1>;
++					cooling-device = <&gpu 3 3>;
++				};
++				map2 {
++					trip = <&gpu_throttle2>;
++					cooling-device = <&gpu 5 5>;
++				};
++				map3 {
++					trip = <&gpu_throttle3>;
++					cooling-device = <&gpu 6 6>;
+ 				};
+ 			};
+ 		};
+@@ -719,3 +749,30 @@
+ 		#thermal-sensor-cells = <1>;
+ 	};
+ };
++
++/ {
++	gpu_opp_table: opp-table-gpu {
++		compatible = "operating-points-v2";
++		opp-260000000 {
++			opp-hz = /bits/ 64 <260000000>;
++		};
++		opp-338000000 {
++			opp-hz = /bits/ 64 <338000000>;
++		};
++		opp-385000000 {
++			opp-hz = /bits/ 64 <385000000>;
++		};
++		opp-455000000 {
++			opp-hz = /bits/ 64 <455000000>;
++		};
++		opp-546000000 {
++			opp-hz = /bits/ 64 <546000000>;
++		};
++		opp-572000000 {
++			opp-hz = /bits/ 64 <572000000>;
++		};
++		opp-683000000 {
++			opp-hz = /bits/ 64 <683000000>;
++		};
++	};
++};
+diff --git a/drivers/clk/samsung/clk-acpm.c b/drivers/clk/samsung/clk-acpm.c
+--- a/drivers/clk/samsung/clk-acpm.c
++++ b/drivers/clk/samsung/clk-acpm.c
+@@ -27,7 +27,8 @@
+ 	struct clk_hw hw;
+ 	unsigned int mbox_chan_id;
+ 	struct acpm_handle *handle;
+-	void __iomem *cpu_cmu;
++	void __iomem *cmu;
++	struct clk *gate_clk;
+ 	struct clk *switch_clk;
+ 	u32 pll_offset;
+ 	u32 switch_offset;
+@@ -82,9 +83,10 @@
+ 
+ /* IDs match cal-if/exynos9610/acpm_dvfs_exynos9610.h. */
+ static const struct acpm_clk_variant exynos9610_acpm_clks[] = {
+-	/* Only the two CPU domains are exposed on this port. */
++	/* CPU and G3D transitions keep voltage sequencing in firmware. */
+ 	[2] = { "acpm_cpucl0", 0x10900000, 0x140, 0x120, 403000000, 1742000000 },
+ 	[3] = { "acpm_cpucl1", 0x10800000, 0x120, 0x100, 936000000, 2314000000 },
++	[4] = { "acpm_g3d", 0x11430000, 0x120, 0x100, 260000000, 683000000 },
+ };
+ 
+ static const struct acpm_clk_driver_data acpm_clk_exynos9610 = {
+@@ -119,74 +121,188 @@
+ 
+ /*
+  * Exynos9610 FVP acknowledges FREQ_GET but returns zero. Like downstream
+- * cal_dfs_get_rate(), read the CPU PLL instead. Firmware retains exclusive
++ * cal_dfs_get_rate(), read the domain PLL instead. Firmware retains exclusive
+  * write ownership of the PLL, muxes, dividers and regulator sequencing.
+- * CPUCL0 and CPUCL1 have different PLL offsets; both were checked against
++ * CPUCL0, CPUCL1 and G3D have different PLL/mux offsets, checked against
+  * the running firmware's FVMAP PLL headers and downstream CMUCAL registers.
+  */
+-static unsigned long exynos9610_cpu_recalc_rate(struct clk_hw *hw,
++static unsigned long exynos9610_domain_recalc_rate(struct clk_hw *hw,
+ 					      unsigned long parent_rate)
+ {
+ 	struct acpm_clk *clk = to_acpm_clk(hw);
+ 	u32 pms, p, m, s;
+-
+-	if (readl(clk->cpu_cmu + 0x1000) & BIT(0)) {
+-		if (!(readl(clk->cpu_cmu + clk->switch_offset) & BIT(4)))
+-			return 26000000;
+-		return clk_get_rate(clk->switch_clk);
+-	}
+-
+-	pms = readl(clk->cpu_cmu + clk->pll_offset);
+-	if (!(pms & BIT(4)))
+-		return 26000000;
+-	p = FIELD_GET(GENMASK(13, 8), pms);
+-	m = FIELD_GET(GENMASK(25, 16), pms);
+-	s = FIELD_GET(GENMASK(2, 0), pms);
+-	if (!p)
+-		return 0;
+-
+-	return div_u64(26000000ULL * m, p << s);
+-}
+-
+-static int exynos9610_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
++	unsigned long rate;
++
++	if (readl(clk->cmu + (clk->id == 4 ? 0x1004 : 0x1000)) & BIT(0)) {
++		if (!(readl(clk->cmu + clk->switch_offset) & BIT(4)))
++			rate = 26000000;
++		else
++			rate = clk_get_rate(clk->switch_clk);
++	} else {
++		pms = readl(clk->cmu + clk->pll_offset);
++		if (!(pms & BIT(4))) {
++			rate = 26000000;
++		} else {
++			p = FIELD_GET(GENMASK(13, 8), pms);
++			m = FIELD_GET(GENMASK(25, 16), pms);
++			s = FIELD_GET(GENMASK(2, 0), pms);
++			if (!p)
++				return 0;
++			rate = div_u64(26000000ULL * m, p << s);
++		}
++	}
++
++	/* G3D has a one-bit output divider; CPU clocks have none here. */
++	if (clk->id == 4)
++		rate /= (readl(clk->cmu + 0x1800) & 1) + 1;
++	return rate;
++}
++
++/* Only characterized points below the port's conservative 683 MHz cap. */
++static const struct {
++	unsigned long nominal;
++	unsigned long actual;
++} exynos9610_g3d_rates[] = {
++	{ 260000000, 260000000 },
++	{ 338000000, 338000000 },
++	{ 385000000, 384800000 },
++	{ 455000000, 455000000 },
++	{ 546000000, 546000000 },
++	{ 572000000, 572000000 },
++	{ 683000000, 682500000 },
++};
++
++/* Refuse GPU scaling if the live calibrated firmware table is unexpected. */
++static int exynos9610_validate_g3d(struct device *dev)
++{
++	void __iomem *fvmap;
++	u32 header, offset, count, khz, uv, members, pll, pms, p, m, shift;
++	unsigned long actual;
++	unsigned int i, j;
++	bool found;
++	int ret = -EINVAL;
++
++	/* Boot DVFS plugin base 0xc400 + downstream fvmap_offset 0x6000. */
++	fvmap = ioremap(0x0204b400, SZ_8K);
++	if (!fvmap)
++		return -ENOMEM;
++	header = readl(fvmap + 4 * 24);
++	count = (header >> 8) & 0xff;
++	offset = readl(fvmap + 4 * 24 + 20) & 0xffff;
++	if ((header & 0xff) != 4 || !count || count > 32 ||
++	    (offset & 3) || offset + count * 8 > SZ_8K)
++		goto out;
++
++	members = readl(fvmap + 4 * 24 + 16) >> 16;
++	if ((members & 3) || members + 4 > SZ_8K)
++		goto out;
++	pll = readl(fvmap + members) & 0xffff;
++	if ((pll & 3) || pll + 8 + count * 4 > SZ_8K ||
++	    readl(fvmap + pll) != 0xa1430120 ||
++	    (readl(fvmap + pll + 4) >> 16) != count)
++		goto out;
++
++	for (i = 0; i < ARRAY_SIZE(exynos9610_g3d_rates); i++) {
++		found = false;
++		for (j = 0; j < count; j++) {
++			khz = readl(fvmap + offset + j * 8);
++			uv = readl(fvmap + offset + j * 8 + 4);
++			pms = readl(fvmap + pll + 8 + j * 4);
++			p = FIELD_GET(GENMASK(13, 8), pms);
++			m = FIELD_GET(GENMASK(25, 16), pms);
++			shift = FIELD_GET(GENMASK(2, 0), pms);
++			actual = p ? div_u64(26000000ULL * m, p << shift) : 0;
++			if (khz == exynos9610_g3d_rates[i].nominal / 1000 &&
++			    actual == exynos9610_g3d_rates[i].actual &&
++			    uv >= 500000 && uv <= 1200000) {
++				found = true;
++				break;
++			}
++		}
++		if (!found)
++			goto out;
++	}
++	ret = 0;
++out:
++	iounmap(fvmap);
++	if (ret)
++		dev_err(dev, "GPU firmware OPP validation failed\n");
++	return ret;
++}
++
++static int exynos9610_domain_set_rate(struct clk_hw *hw, unsigned long rate,
+ 				 unsigned long parent_rate)
+ {
+ 	struct acpm_clk *clk = to_acpm_clk(hw);
+-	unsigned long actual;
++	unsigned long actual, expected = rate;
++	unsigned int i;
+ 	int ret;
+ 
+ 	if (rate < clk->min_rate || rate > clk->max_rate)
+ 		return -EINVAL;
++
++	if (clk->id == 4) {
++		for (i = 0; i < ARRAY_SIZE(exynos9610_g3d_rates); i++)
++			if (exynos9610_g3d_rates[i].nominal == rate)
++				break;
++		if (i == ARRAY_SIZE(exynos9610_g3d_rates))
++			return -EINVAL;
++		expected = exynos9610_g3d_rates[i].actual;
++	}
+ 
+ 	ret = acpm_clk_set_rate(hw, rate, parent_rate);
+ 	if (ret)
+ 		return ret;
+ 
+-	actual = exynos9610_cpu_recalc_rate(hw, parent_rate);
+-	if (actual != rate) {
+-		pr_err_ratelimited("ACPM CPU%u: requested %lu Hz, read %lu Hz\n",
+-				   clk->id - 2, rate, actual);
++	actual = exynos9610_domain_recalc_rate(hw, parent_rate);
++	if (actual != expected) {
++		pr_err_ratelimited("ACPM domain %u: requested %lu Hz, read %lu Hz\n",
++				   clk->id, expected, actual);
+ 		return -EIO;
+ 	}
+ 	return 0;
+ }
+ 
+-static const struct clk_ops exynos9610_cpu_clk_ops = {
+-	.recalc_rate = exynos9610_cpu_recalc_rate,
+-	.determine_rate = clk_determine_rate_noop,
+-	.set_rate = exynos9610_cpu_set_rate,
++/* Reject bad requests before CCF reaches its void set-rate walk. */
++static int exynos9610_domain_determine_rate(struct clk_hw *hw,
++					  struct clk_rate_request *req)
++{
++	struct acpm_clk *clk = to_acpm_clk(hw);
++	unsigned int i;
++
++	if (req->rate < clk->min_rate || req->rate > clk->max_rate)
++		return -EINVAL;
++	if (clk->id != 4)
++		return 0;
++	for (i = 0; i < ARRAY_SIZE(exynos9610_g3d_rates); i++)
++		if (req->rate == exynos9610_g3d_rates[i].nominal)
++			return 0;
++	return -EINVAL;
++}
++
++static const struct clk_ops exynos9610_domain_clk_ops = {
++	.recalc_rate = exynos9610_domain_recalc_rate,
++	.determine_rate = exynos9610_domain_determine_rate,
++	.set_rate = exynos9610_domain_set_rate,
+ };
+ 
+ static int acpm_clk_register(struct device *dev, struct acpm_clk *aclk,
+ 			     const char *name)
+ {
+ 	struct clk_init_data init = {};
++	const char *parent_name;
+ 
+ 	init.name = name;
+ 	init.ops = &acpm_clk_ops;
+-	if (aclk->cpu_cmu) {
+-		init.ops = &exynos9610_cpu_clk_ops;
++	if (aclk->cmu) {
++		init.ops = &exynos9610_domain_clk_ops;
+ 		init.flags = CLK_GET_RATE_NOCACHE;
++	}
++	/* Retain Panfrost's existing physical core-gate lifetime. */
++	if (aclk->gate_clk) {
++		parent_name = __clk_get_name(aclk->gate_clk);
++		init.parent_names = &parent_name;
++		init.num_parents = 1;
+ 	}
+ 	aclk->hw.init = &init;
+ 
+@@ -204,7 +320,7 @@
+ 	unsigned int mbox_chan_id;
+ 	int i, err, count;
+ 
+-	/* Refuse CPU scaling until calibrated thermal monitoring is bound. */
++	/* Refuse scaling until calibrated thermal monitoring is bound. */
+ 	if (platform_get_device_id(pdev)->driver_data ==
+ 	    (kernel_ulong_t)&acpm_clk_exynos9610) {
+ 		struct device_node *np;
+@@ -253,10 +369,11 @@
+ 		}
+ 
+ 		if (variant->cmu_base) {
+-			aclk->cpu_cmu = devm_ioremap(dev, variant->cmu_base, SZ_8K);
+-			if (!aclk->cpu_cmu)
++			aclk->cmu = devm_ioremap(dev, variant->cmu_base, SZ_8K);
++			if (!aclk->cmu)
+ 				return -ENOMEM;
+ 			aclk->switch_clk = devm_clk_get(dev->parent,
++						 i == 4 ? "g3d-switch" :
+ 						 i == 2 ? "cpucl0-switch" : "cpucl1-switch");
+ 			if (IS_ERR(aclk->switch_clk))
+ 				return dev_err_probe(dev, PTR_ERR(aclk->switch_clk),
+@@ -267,6 +384,16 @@
+ 			aclk->max_rate = variant->max_rate;
+ 		}
+ 
++		if (data == &acpm_clk_exynos9610 && i == 4) {
++			err = exynos9610_validate_g3d(dev);
++			if (err)
++				return err;
++			aclk->gate_clk = devm_clk_get(dev->parent, "g3d-gate");
++			if (IS_ERR(aclk->gate_clk))
++				return dev_err_probe(dev, PTR_ERR(aclk->gate_clk),
++						     "Failed to get G3D gate clock\n");
++		}
++
+ 		/*
+ 		 * The code assumes the clock IDs start from zero,
+ 		 * are sequential and do not have gaps.
+diff --git a/drivers/firmware/samsung/exynos-acpm-dvfs.c b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+--- a/drivers/firmware/samsung/exynos-acpm-dvfs.c
++++ b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+@@ -57,7 +57,8 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return FIELD_GET(ACPM_DVFS_ID, cmd[0]) == clk_id ? 0 : -EIO;
++	/* FVP returns a status (zero on success), not the requested ID. */
++	return FIELD_GET(ACPM_DVFS_ID, cmd[0]) ? -EIO : 0;
+ }
+ 
+ static void acpm_dvfs_init_get_rate_cmd(u32 cmd[4], unsigned int clk_id)
+diff --git a/drivers/gpu/drm/panfrost/panfrost_devfreq.c b/drivers/gpu/drm/panfrost/panfrost_devfreq.c
+--- a/drivers/gpu/drm/panfrost/panfrost_devfreq.c
++++ b/drivers/gpu/drm/panfrost/panfrost_devfreq.c
+@@ -41,6 +41,16 @@
+ 	dev_pm_opp_put(opp);
+ 
+ 	err = dev_pm_opp_set_rate(dev, *freq);
++	if (!err && !pfdev->comp->num_supplies) {
++		unsigned long actual = clk_get_rate(pfdev->clock);
++
++		/* Firmware OPP names round up PLL rates by at most 0.1%. */
++		if (actual > *freq || actual < *freq - *freq / 1000) {
++			dev_err_ratelimited(dev, "GPU clock readback mismatch: %lu/%lu Hz\n",
++					    actual, *freq);
++			return -EIO;
++		}
++	}
+ 	if (!err)
+ 		pfdev->pfdevfreq.current_frequency = *freq;
+ 
+@@ -215,9 +225,12 @@
+ 	pfdevfreq->devfreq = devfreq;
+ 
+ 	cooling = devfreq_cooling_em_register(devfreq, NULL);
+-	if (IS_ERR(cooling))
++	if (IS_ERR(cooling)) {
++		/* Firmware DVFS requires a working Linux cooling device. */
++		if (!pfdev->comp->num_supplies)
++			return PTR_ERR(cooling);
+ 		DRM_DEV_INFO(dev, "Failed to register cooling device\n");
+-	else
++	} else
+ 		pfdevfreq->cooling = cooling;
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -1079,6 +1079,11 @@
+ 	.pm_domain_names = NULL,
+ };
+ 
++/* ACPM owns the rail and sequences voltage inside clk_set_rate(). */
++static const struct panfrost_compatible exynos9611_data = {
++	.num_pm_domains = 1,
++};
++
+ static const struct panfrost_compatible default_pm_rt_data = {
+ 	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
+ 	.supply_names = default_supplies,
+@@ -1155,6 +1160,7 @@
+ 
+ static const struct of_device_id dt_match[] = {
+ 	/* Set first to probe before the generic compatibles */
++	{ .compatible = "samsung,exynos9611-mali", .data = &exynos9611_data },
+ 	{ .compatible = "amlogic,meson-gxm-mali",
+ 	  .data = &amlogic_data, },
+ 	{ .compatible = "amlogic,meson-g12a-mali",

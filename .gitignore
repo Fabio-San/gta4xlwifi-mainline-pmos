@@ -1,0 +1,30 @@
+# Build outputs
+artifacts/
+sources/
+build/
+build-*/
+out/
+*.img
+*.cpio
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# Local state / secrets
+*.conf.local
+*.env
+secrets/
+*.key
+*.pem
+id_rsa*
+
+# Python / caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

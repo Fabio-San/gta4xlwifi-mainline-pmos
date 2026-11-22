@@ -1,0 +1,1288 @@
+diff --git a/Makefile b/Makefile
+index cfa8c3b..90eb6eb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ ccflags-y += -I$(src)/include -I$(src)/core -include $(src)/gta4xl.h
+-obj-m += scsc_platform_mif.o scsc_mx.o scsc_wlan.o
++obj-m += scsc_platform_mif.o scsc_mx.o scsc_wlan.o scsc_bt.o
+ scsc_platform_mif-y := core/platform_mif_module.o core/platform_mif_9610.o
+ scsc_mx-y := core/mxlog_transport.o core/fw_panic_record.o core/panicmon.o core/suspendmon.o core/mxlog.o core/mxproc.o core/scsc_service.o core/scsc_mx_module.o core/scsc_mx_impl.o core/mxman.o core/miframman.o core/mifmboxman.o core/mifproc.o core/mifintrbit.o core/fwhdr.o core/fwimage.o core/cpacket_buffer.o core/mifstream.o core/mxmgmt_transport.o core/gdb_transport.o core/scsc_lerna.o core/mxsyserr.o core/mxfwconfig.o core/mx140_file.o
++scsc_bt-y := bt/scsc_bt_module.o bt/scsc_shm.o bt/scsc_avdtp_detect.o bt/scsc_bt_qos.o bt/scsc_bluez.o
+ scsc_wlan-y := wlan/hip4.o wlan/mbulk.o wlan/dev.o wlan/cfg80211_ops.o wlan/netif.o wlan/rx.o wlan/tx.o wlan/ba.o wlan/sap_mlme.o wlan/sap_ma.o wlan/sap_dbg.o wlan/sap_test.o wlan/mib.o wlan/mib_text_convert.o wlan/debug.o wlan/debug_frame.o wlan/procfs.o wlan/mgt.o wlan/mlme.o wlan/udi.o wlan/log_clients.o wlan/src_sink.o wlan/fw_test.o wlan/cac.o wlan/scsc_wifi_fcq.o wlan/traffic_monitor.o wlan/reg_info.o wlan/scsc_wlan_mmap.o wlan/hip.o wlan/cm_if.o
+diff --git a/bt/scsc_bluez.c b/bt/scsc_bluez.c
+index 1c58f95..28a4388 100755
+--- a/bt/scsc_bluez.c
++++ b/bt/scsc_bluez.c
+@@ -4,6 +4,11 @@
+  *
+  * BT BlueZ interface
+  *
++ * Linux 7.3 port: the Samsung H4 character device is presented to the
++ * upstream Bluetooth stack as a virtual HCI controller.  The kernel's
++ * h4_recv_buf() helper is private to hci_uart and needs a struct hci_uart,
++ * so the small H4 demultiplexer below is self-contained.
++ *
+  ****************************************************************************/
+ 
+ #include <linux/init.h>
+@@ -11,69 +16,155 @@
+ #include <linux/module.h>
+ #include <linux/types.h>
+ #include <linux/fs.h>
+-#include <linux/module.h>
+ #include <linux/firmware.h>
+ #include <linux/poll.h>
+ #include <linux/slab.h>
+ #include <linux/cdev.h>
+ #include <linux/device.h>
+ #include <linux/kthread.h>
+-#include <linux/proc_fs.h>
+-#include <asm/io.h>
+-#include <asm/termios.h>
+-#include <linux/wakelock.h>
+-#include <linux/delay.h>
++#include <linux/workqueue.h>
+ #include <linux/skbuff.h>
+-#include <linux/rfkill.h>
+-#include <linux/platform_device.h>
++#include <linux/unaligned.h>
+ 
+ #include <net/bluetooth/bluetooth.h>
+ #include <net/bluetooth/hci_core.h>
+-#include "../../../bluetooth/h4_recv.h"
+ 
+ #include <scsc/scsc_logring.h>
+ 
+-static struct hci_dev      		*hdev;
+-static struct device 			*dev_ref;
+-static const struct file_operations 	*bt_fs;
+-static struct workqueue_struct          *wq;
+-static struct work_struct		open_worker;
+-static struct work_struct		close_worker;
+-static struct work_struct		read_work;
++#include "scsc_bt_priv.h"
++
++static struct hci_dev			*hdev;
++static struct device			*dev_ref;
++static const struct file_operations	*bt_fs;
++static atomic_t				*error_count_ref;
++static wait_queue_head_t		*read_wait_ref;
++static struct workqueue_struct		*wq;
++static struct delayed_work		read_work;
+ static u8				receive_buffer[1024];
+-static bool	                 	terminate_read;
+-static atomic_t 			*error_count_ref;
+-static wait_queue_head_t       		*read_wait_ref;
+-static struct file			s_file;
++static bool				terminate_read;
++
++/* H4 receive state */
++static struct sk_buff			*rx_skb;
++static u8				rx_type;
++static u16				rx_hlen;
++static u16				rx_dlen;
++static bool				rx_header_done;
++
++static void slsi_bt_rx_reset(void)
++{
++	if (rx_skb) {
++		kfree_skb(rx_skb);
++		rx_skb = NULL;
++	}
++	rx_header_done = false;
++	rx_hlen = 0;
++	rx_dlen = 0;
++}
+ 
+-static struct platform_device *slsi_btz_pdev;
+-static struct rfkill *btz_rfkill;
++/* Feed H4 bytes into a per-packet skb and hand complete frames to BlueZ. */
++static int slsi_bt_recv(struct hci_dev *hdev, const u8 *data, int count)
++{
++	while (count) {
++		int n, need;
++
++		if (!rx_skb) {
++			u16 maxlen;
+ 
+-static const struct h4_recv_pkt scsc_recv_pkts[] = {
+-	{ H4_RECV_ACL,   .recv = hci_recv_frame },
+-	{ H4_RECV_EVENT, .recv = hci_recv_frame },
+-};
++			rx_type = data[0];
++			switch (rx_type) {
++			case HCI_EVENT_PKT:
++				rx_hlen = HCI_EVENT_HDR_SIZE;
++				maxlen = HCI_MAX_EVENT_SIZE;
++				break;
++			case HCI_ACLDATA_PKT:
++				rx_hlen = HCI_ACL_HDR_SIZE;
++				maxlen = HCI_MAX_FRAME_SIZE;
++				break;
++			case HCI_SCODATA_PKT:
++				rx_hlen = HCI_SCO_HDR_SIZE;
++				maxlen = HCI_MAX_SCO_SIZE;
++				break;
++			default:
++				SCSC_TAG_ERR(BT_H4, "unknown H4 packet type 0x%02x\n",
++					     rx_type);
++				return -EILSEQ;
++			}
++
++			rx_skb = bt_skb_alloc(maxlen, GFP_ATOMIC);
++			if (!rx_skb)
++				return -ENOMEM;
++
++			hci_skb_pkt_type(rx_skb) = rx_type;
++			rx_header_done = false;
++			rx_dlen = 0;
++
++			/* The type byte is not part of the skb payload. */
++			data++;
++			count--;
++			continue;
++		}
++
++		if (!rx_header_done) {
++			need = rx_hlen - rx_skb->len;
++			n = min(need, count);
++			skb_put_data(rx_skb, data, n);
++			data += n;
++			count -= n;
++
++			if (rx_skb->len == rx_hlen) {
++				if (rx_type == HCI_EVENT_PKT)
++					rx_dlen = rx_skb->data[1];
++				else if (rx_type == HCI_SCODATA_PKT)
++					rx_dlen = rx_skb->data[2];
++				else
++					rx_dlen = get_unaligned_le16(&rx_skb->data[2]);
++				rx_header_done = true;
++			}
++			continue;
++		}
++
++		need = (rx_hlen + rx_dlen) - rx_skb->len;
++		n = min(need, count);
++		skb_put_data(rx_skb, data, n);
++		data += n;
++		count -= n;
++
++		if (rx_skb->len == rx_hlen + rx_dlen) {
++			struct sk_buff *skb = rx_skb;
++
++			rx_skb = NULL;
++			rx_header_done = false;
++
++			hdev->stat.byte_rx += skb->len;
++			if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT)
++				hdev->stat.acl_rx++;
++			else if (hci_skb_pkt_type(skb) == HCI_SCODATA_PKT)
++				hdev->stat.sco_rx++;
++			else
++				hdev->stat.evt_rx++;
++
++			if (hci_recv_frame(hdev, skb)) {
++				hdev->stat.err_rx++;
++				SCSC_TAG_ERR(BT_H4, "hci_recv_frame failed\n");
++			}
++		}
++	}
++
++	return 0;
++}
+ 
+ static void slsi_bt_fs_read_func(struct work_struct *work)
+ {
+ 	int ret;
+-	struct sk_buff *skb = NULL;
+ 
+-	while ((ret = bt_fs->read(&s_file, receive_buffer, sizeof(receive_buffer), NULL)) >= 0) {
++	while ((ret = scsc_bt_shm_h4_read_kernel(receive_buffer,
++						 sizeof(receive_buffer))) >= 0) {
+ 		if (terminate_read)
+ 			break;
+ 
+ 		if (ret > 0) {
+-			skb = h4_recv_buf(hdev, skb, receive_buffer,
+-					ret, scsc_recv_pkts,
+-					ARRAY_SIZE(scsc_recv_pkts));
+-
+-			if (IS_ERR(skb)) {
+-				SCSC_TAG_ERR(BT_COMMON, "corrupted event packet\n");
+-				hdev->stat.err_rx++;
++			if (slsi_bt_recv(hdev, receive_buffer, ret) < 0)
+ 				break;
+-			}
+-			hdev->stat.byte_rx += ret;
+ 		}
+ 	}
+ 
+@@ -86,20 +177,39 @@ static int slsi_bt_open(struct hci_dev *hdev)
+ 
+ 	SCSC_TAG_INFO(BT_COMMON, "enter\n");
+ 
++	if (!bt_fs)
++		return -ENODEV;
++
+ 	err = bt_fs->open(NULL, NULL);
++	if (err) {
++		SCSC_TAG_ERR(BT_COMMON, "H4 open failed: %d\n", err);
++		return err;
++	}
+ 
+-	if (0 == err) {
+-		terminate_read = false;
+-		if (wq == NULL) {
+-			wq = create_singlethread_workqueue("slsi_bt_bluez_wq");
+-			INIT_WORK(&read_work, slsi_bt_fs_read_func);
+-		}
+-		queue_work(wq, &read_work);
++	/* The BlueZ bridge passes kernel buffers through the shared-memory
++	 * path; the character device cannot be open at the same time. */
++	bt_service.kernel_io = true;
++
++	slsi_bt_rx_reset();
++	terminate_read = false;
++
++	if (!wq)
++		wq = create_singlethread_workqueue("slsi_bt_bluez_wq");
++	if (!wq) {
++		bt_service.kernel_io = false;
++		bt_fs->release(NULL, NULL);
++		return -ENOMEM;
+ 	}
+ 
++	/* hdev->open() runs before HCI_INIT is set, so wait briefly before
++	 * reading.  The firmware may already emit events and hci_recv_frame()
++	 * drops frames received before the core is ready to process them. */
++	INIT_DELAYED_WORK(&read_work, slsi_bt_fs_read_func);
++	queue_delayed_work(wq, &read_work, msecs_to_jiffies(20));
++
+ 	SCSC_TAG_INFO(BT_COMMON, "done\n");
+ 
+-	return err;
++	return 0;
+ }
+ 
+ static int slsi_bt_close(struct hci_dev *hdev)
+@@ -110,19 +220,25 @@ static int slsi_bt_close(struct hci_dev *hdev)
+ 
+ 	terminate_read = true;
+ 
+-	if (error_count_ref != NULL)
++	if (error_count_ref)
+ 		atomic_inc(error_count_ref);
+ 
+-	if (read_wait_ref != NULL)
++	if (read_wait_ref)
+ 		wake_up(read_wait_ref);
+ 
+-	cancel_work_sync(&read_work);
++	cancel_delayed_work_sync(&read_work);
++	slsi_bt_rx_reset();
+ 
+ 	SCSC_TAG_INFO(BT_COMMON, "releasing service\n");
+ 
+-	ret = bt_fs->release(NULL, NULL);
++	if (bt_fs)
++		ret = bt_fs->release(NULL, NULL);
++	else
++		ret = -ENODEV;
+ 
+-	if (wq != NULL) {
++	bt_service.kernel_io = false;
++
++	if (wq) {
+ 		destroy_workqueue(wq);
+ 		wq = NULL;
+ 	}
+@@ -139,74 +255,84 @@ static int slsi_bt_flush(struct hci_dev *hdev)
+ 
+ static int slsi_bt_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+ {
++	u16 len = skb->len;
++	u8 type = hci_skb_pkt_type(skb);
+ 	int ret;
+ 
+-	SCSC_TAG_DEBUG(BT_H4, "sending frame(data=%p, len=%u)\n", skb->data, skb->len);
+-
+-	memcpy(skb_push(skb, 1), &bt_cb(skb)->pkt_type, 1);
++	SCSC_TAG_DEBUG(BT_H4, "sending frame(data=%p, len=%u)\n",
++		       skb->data, skb->len);
+ 
+-	ret = bt_fs->write(NULL, skb->data, skb->len, NULL);
+-	if (ret >= 0) {
++	if (!bt_fs) {
+ 		kfree_skb(skb);
++		return -ENODEV;
++	}
+ 
+-		/* Update HCI stat counters */
+-		hdev->stat.byte_tx += skb->len;
+-
+-		switch (hci_skb_pkt_type(skb)) {
+-			case HCI_COMMAND_PKT:
+-				hdev->stat.cmd_tx++;
+-				break;
++	memcpy(skb_push(skb, 1), &type, 1);
+ 
+-			case HCI_ACLDATA_PKT:
+-				hdev->stat.acl_tx++;
+-				break;
++	ret = scsc_bt_shm_h4_write_kernel(skb->data, skb->len);
++	if (ret >= 0) {
++		hdev->stat.byte_tx += len;
+ 
+-			case HCI_SCODATA_PKT:
+-				hdev->stat.sco_tx++;
+-				break;
++		switch (type) {
++		case HCI_COMMAND_PKT:
++			hdev->stat.cmd_tx++;
++			break;
++		case HCI_ACLDATA_PKT:
++			hdev->stat.acl_tx++;
++			break;
++		case HCI_SCODATA_PKT:
++			hdev->stat.sco_tx++;
++			break;
+ 		}
++
++		kfree_skb(skb);
+ 	}
+ 
+ 	return ret;
+ }
+ 
+-static void slsi_bt_open_worker(struct work_struct *work)
++static int slsi_bt_register(void)
+ {
+ 	int err;
+ 
+-	if (!hdev) {
+-		hdev = hci_alloc_dev();
+-		if (!hdev) {
+-			SCSC_TAG_ERR(BT_COMMON, "failed to allocate hci device\n");
+-			return;
+-		}
++	if (hdev)
++		return 0;
++
++	hdev = hci_alloc_dev();
++	if (!hdev)
++		return -ENOMEM;
+ 
+-		hdev->bus = HCI_VIRTUAL;
+-		hdev->dev_type = HCI_BREDR;
++	hdev->bus = HCI_VIRTUAL;
+ 
++	if (dev_ref)
+ 		SET_HCIDEV_DEV(hdev, dev_ref);
+ 
+-		hdev->open     = slsi_bt_open;
+-		hdev->close    = slsi_bt_close;
+-		hdev->flush    = slsi_bt_flush;
+-		hdev->send     = slsi_bt_send_frame;
++	hdev->open  = slsi_bt_open;
++	hdev->close = slsi_bt_close;
++	hdev->flush = slsi_bt_flush;
++	hdev->send  = slsi_bt_send_frame;
+ 
+-		err = hci_register_dev(hdev);
+-		if (err < 0) {
+-			SCSC_TAG_ERR(BT_COMMON, "failed to register hci device (err: %d)\n", err);
+-			hci_free_dev(hdev);
+-			hdev = NULL;
+-		}
++	err = hci_register_dev(hdev);
++	if (err < 0) {
++		SCSC_TAG_ERR(BT_COMMON,
++			     "failed to register hci device (err: %d)\n", err);
++		hci_free_dev(hdev);
++		hdev = NULL;
++		return err;
+ 	}
++
++	SCSC_TAG_INFO(BT_COMMON, "registered %s\n", hdev->name);
++	return 0;
+ }
+ 
+-static void slsi_bt_close_worker(struct work_struct *work)
++static void slsi_bt_unregister(void)
+ {
+-	if (hdev) {
+-		hci_unregister_dev(hdev);
+-		hci_free_dev(hdev);
+-		hdev = NULL;
+-	}
++	if (!hdev)
++		return;
++
++	hci_unregister_dev(hdev);
++	hci_free_dev(hdev);
++	hdev = NULL;
+ }
+ 
+ void slsi_bt_notify_probe(struct device *dev,
+@@ -220,118 +346,21 @@ void slsi_bt_notify_probe(struct device *dev,
+ 	dev_ref         = dev;
+ 
+ 	SCSC_TAG_INFO(BT_COMMON, "SLSI BT BlueZ probe\n");
++
++	slsi_bt_register();
+ }
+ 
+ void slsi_bt_notify_remove(void)
+ {
++	SCSC_TAG_INFO(BT_COMMON, "SLSI BT BlueZ remove\n");
++
++	slsi_bt_unregister();
++
+ 	error_count_ref = NULL;
+ 	read_wait_ref   = NULL;
+ 	dev_ref         = NULL;
+ }
+ 
+-static int slsi_bt_power_control_set_param_cb(const char *buffer,
+-					      const struct kernel_param *kp)
+-{
+-	int ret;
+-	u32 value;
+-
+-	ret = kstrtou32(buffer, 0, &value);
+-	if (!ret) {
+-		if (value && dev_ref) {
+-			INIT_WORK(&open_worker, slsi_bt_open_worker);
+-			schedule_work(&open_worker);
+-		} else if (0 == value) {
+-			INIT_WORK(&close_worker, slsi_bt_close_worker);
+-			schedule_work(&close_worker);
+-		}
+-	}
+-
+-	return ret;
+-}
+-
+-static int slsi_bt_power_control_get_param_cb(char *buffer,
+-					      const struct kernel_param *kp)
+-{
+-	return sprintf(buffer, "%u\n", (hdev != NULL ? 1 : 0));
+-}
+-
+-static struct kernel_param_ops slsi_bt_power_control_ops = {
+-	.set = slsi_bt_power_control_set_param_cb,
+-	.get = slsi_bt_power_control_get_param_cb,
+-};
+-
+-module_param_cb(power_control, &slsi_bt_power_control_ops, NULL, S_IRUGO | S_IWUSR);
+-MODULE_PARM_DESC(power_control,
+-		 "Enables/disable BlueZ registration");
+-
+-static int btz_rfkill_set(void *data, bool blocked)
+-{
+-	if (!blocked && dev_ref) {
+-		INIT_WORK(&open_worker, slsi_bt_open_worker);
+-		schedule_work(&open_worker);
+-	} else if (blocked) {
+-		INIT_WORK(&close_worker, slsi_bt_close_worker);
+-		schedule_work(&close_worker);
+-	}
+-
+-	return 0;
+-}
+-
+-static const struct rfkill_ops btz_rfkill_ops = {
+-       .set_block = btz_rfkill_set,
+-};
+-
+-static int __init slsi_bluez_init(void)
+-{
+-	int ret;
+-
+-	slsi_btz_pdev = platform_device_alloc("scsc-bluez", -1);
+-	if (!slsi_btz_pdev) {
+-		return -ENOMEM;
+-	}
+-
+-	ret = platform_device_add(slsi_btz_pdev);
+-	if (ret) {
+-		goto err_slsi_btz_pdev;
+-	}
+-
+-	btz_rfkill = rfkill_alloc("scsc-bluez-rfkill", &slsi_btz_pdev->dev,
+-								RFKILL_TYPE_BLUETOOTH, &btz_rfkill_ops, NULL);
+-	if (!btz_rfkill) {
+-		goto err_btz_rfkill_alloc;
+-	}
+-
+-	rfkill_init_sw_state(btz_rfkill, 1);
+-
+-	ret = rfkill_register(btz_rfkill);
+-	if (ret) {
+-		goto err_btz_rfkill_reg;
+-	}
+-
+-	return 0;
+-
+-err_btz_rfkill_reg:
+-	rfkill_destroy(btz_rfkill);
+-
+-err_btz_rfkill_alloc:
+-	platform_device_del(slsi_btz_pdev);
+-
+-err_slsi_btz_pdev:
+-	platform_device_put(slsi_btz_pdev);
+-
+-	return ret;
+-}
+-
+-static void __exit slsi_bluez_exit(void)
+-{
+-	platform_device_unregister(slsi_btz_pdev);
+-	rfkill_unregister(btz_rfkill);
+-	rfkill_destroy(btz_rfkill);
+-}
+-
+-module_init(slsi_bluez_init);
+-module_exit(slsi_bluez_exit);
+-
+ MODULE_DESCRIPTION("SCSC BT Bluez");
+ MODULE_AUTHOR("SLSI");
+ MODULE_LICENSE("GPL and additional rights");
+diff --git a/bt/scsc_bt_module.c b/bt/scsc_bt_module.c
+index ae976f9..d2a1a76 100755
+--- a/bt/scsc_bt_module.c
++++ b/bt/scsc_bt_module.c
+@@ -31,17 +31,13 @@
+ #include <linux/seq_file.h>
+ #include <linux/ctype.h>
+ 
+-#if defined(CONFIG_ARCH_EXYNOS) || defined(CONFIG_ARCH_EXYNOS9)
+-#include <linux/soc/samsung/exynos-soc.h>
+-#endif
+-
+ #include <scsc/scsc_logring.h>
+ #include <scsc/kic/slsi_kic_lib.h>
+ #include <scsc/kic/slsi_kic_bt.h>
+ #include <scsc/kic/slsi_kic_ant.h>
+ 
+ #include "scsc_bt_priv.h"
+-#include "../scsc/scsc_mx_impl.h"
++#include "../core/scsc_mx_impl.h"
+ 
+ #ifdef CONFIG_SCSC_LOG_COLLECTION
+ #include <scsc/scsc_log_collector.h>
+@@ -97,9 +93,6 @@ static int ant_service_start_count;
+ #endif
+ 
+ static u64 bluetooth_address;
+-#if defined(CONFIG_ARCH_EXYNOS) || defined(CONFIG_ARCH_EXYNOS9)
+-static char bluetooth_address_fallback[] = "00:00:00:00:00:00";
+-#endif
+ static u32 bt_info_trigger;
+ static u32 bt_info_interrupt;
+ static u32 firmware_control;
+@@ -124,13 +117,6 @@ module_param(bluetooth_address, ullong, S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(bluetooth_address,
+ 		 "Bluetooth address");
+ 
+-#if defined(CONFIG_ARCH_EXYNOS) || defined(CONFIG_ARCH_EXYNOS9)
+-module_param_string(bluetooth_address_fallback, bluetooth_address_fallback,
+-		    sizeof(bluetooth_address_fallback), 0444);
+-MODULE_PARM_DESC(bluetooth_address_fallback,
+-		 "Bluetooth address as proposed by the driver");
+-#endif
+-
+ module_param(service_start_count, int, S_IRUGO);
+ MODULE_PARM_DESC(service_start_count,
+ 		"Track how many times the BT service has been started");
+@@ -700,12 +686,8 @@ done_error:
+ static void get_bluetooth_address(uint32_t *lap, uint8_t *uap, uint16_t *nap)
+ {
+ #ifdef SCSC_BT_ADDR
+-	struct firmware *firm;
+-#endif
+-#if defined(CONFIG_ARCH_EXYNOS) || defined(CONFIG_ARCH_EXYNOS9)
+-	*nap = (exynos_soc_info.unique_id & 0x000000FFFF00) >> 8;
+-	*uap = (exynos_soc_info.unique_id & 0x0000000000FF);
+-	*lap = (exynos_soc_info.unique_id & 0xFFFFFF000000) >> 24;
++	const struct firmware *firm;
++	int err;
+ #endif
+ 
+ 	if (bluetooth_address) {
+@@ -727,24 +709,24 @@ static void get_bluetooth_address(uint32_t *lap, uint8_t *uap, uint16_t *nap)
+ 	} else if (firm && firm->size) {
+ 		u32 u[SCSC_BT_ADDR_LEN];
+ 
+-#ifdef CONFIG_SCSC_BT_BLUEZ
++#ifdef CONFIG_SCSC_BT_ADDRESS_IN_FILE
+ 		/* Convert the data into a native format */
+-		if (sscanf(firm->data, "%04x %02X %06x", &u[0], &u[1], &u[2])
++		if (sscanf(firm->data, "%02X:%02X:%02X:%02X:%02X:%02X",
++			   &u[0], &u[1], &u[2], &u[3], &u[4], &u[5])
+ 		    == SCSC_BT_ADDR_LEN) {
+-			*lap = u[2];
+-			*uap = u[1];
+-			*nap = u[0];
++			*lap = (u[3] << 16) | (u[4] << 8) | u[5];
++			*uap = u[2];
++			*nap = (u[0] << 8) | u[1];
+ 		} else
+ 			SCSC_TAG_WARNING(BT_COMMON,
+ 				"data size incorrect = %zu\n", firm->size);
+ #else
+ 		/* Convert the data into a native format */
+-		if (sscanf(firm->data, "%02X:%02X:%02X:%02X:%02X:%02X",
+-			   &u[0], &u[1], &u[2], &u[3], &u[4], &u[5])
++		if (sscanf(firm->data, "%04x %02X %06x", &u[0], &u[1], &u[2])
+ 		    == SCSC_BT_ADDR_LEN) {
+-			*lap = (u[3] << 16) | (u[4] << 8) | u[5];
+-			*uap = u[2];
+-			*nap = (u[0] << 8) | u[1];
++			*lap = u[2];
++			*uap = u[1];
++			*nap = u[0];
+ 		} else
+ 			SCSC_TAG_WARNING(BT_COMMON,
+ 				"data size incorrect = %zu\n", firm->size);
+@@ -759,6 +741,11 @@ static void get_bluetooth_address(uint32_t *lap, uint8_t *uap, uint16_t *nap)
+ 	}
+ #endif
+ 
++	SCSC_TAG_INFO(BT_COMMON,
++		      "Bluetooth address: %02X:%02X:%02X:%02X:%02X:%02X\n",
++		      (*nap >> 8) & 0xff, *nap & 0xff, *uap,
++		      (*lap >> 16) & 0xff, (*lap >> 8) & 0xff, *lap & 0xff);
++
+ #ifdef CONFIG_SCSC_DEBUG
+ 	SCSC_TAG_DEBUG(
+ 		BT_COMMON,
+@@ -1752,6 +1739,8 @@ static void slsi_bt_service_remove(struct scsc_mx_module_client *module_client,
+ 	SCSC_TAG_INFO(BT_COMMON,
+ 		      "BT service remove (%s %p)\n", module_client->name, mx);
+ 
++	bool notify = false;
++
+ 	mutex_lock(&bt_start_mutex);
+ 	if (reason == SCSC_MODULE_CLIENT_REASON_RECOVERY &&
+ 	    bt_service.recovery_level == 0) {
+@@ -1790,17 +1779,25 @@ static void slsi_bt_service_remove(struct scsc_mx_module_client *module_client,
+ 		bt_service.h4_write_offset = 0;
+ 	}
+ 
+-	slsi_bt_notify_remove();
+-	put_device(bt_service.dev);
+-	common_service.maxwell_core = NULL;
++	notify = true;
+ 
+ done:
+ 	mutex_unlock(&bt_start_mutex);
+ 
++	/*
++	 * hci_unregister_dev() closes the controller, and that close path
++	 * takes bt_start_mutex through the H4 release callback.  It must run
++	 * without the mutex held or unload deadlocks.
++	 */
++	if (notify) {
++		slsi_bt_notify_remove();
++		put_device(bt_service.dev);
++		common_service.maxwell_core = NULL;
++	}
++
+ 	SCSC_TAG_INFO(BT_COMMON,
+ 	      "BT service remove complete (%s %p)\n", module_client->name, mx);
+ }
+-
+ /* BT service driver registration interface */
+ static struct scsc_mx_module_client bt_driver = {
+ 	.name = "BT driver",
+@@ -2055,12 +2052,11 @@ static int slsi_bt_service_proc_open(struct inode *inode, struct file *file)
+ 	return single_open(file, slsi_bt_service_proc_show, NULL);
+ }
+ 
+-static const struct file_operations scsc_bt_procfs_fops = {
+-	.owner   = THIS_MODULE,
+-	.open    = slsi_bt_service_proc_open,
+-	.read    = seq_read,
+-	.llseek  = seq_lseek,
+-	.release = single_release,
++static const struct proc_ops scsc_bt_procfs_ops = {
++	.proc_open    = slsi_bt_service_proc_open,
++	.proc_read    = seq_read,
++	.proc_lseek   = seq_lseek,
++	.proc_release = single_release,
+ };
+ 
+ static void scsc_update_btlog_params(void)
+@@ -2465,7 +2461,7 @@ static int __init scsc_bt_module_init(void)
+ 	procfs_dir = proc_mkdir("driver/scsc_bt", NULL);
+ 	if (NULL != procfs_dir) {
+ 		proc_create_data("stats", S_IRUSR | S_IRGRP,
+-				 procfs_dir, &scsc_bt_procfs_fops, NULL);
++				 procfs_dir, &scsc_bt_procfs_ops, NULL);
+ 	}
+ 
+ 	ret = alloc_chrdev_region(&bt_service.device, 0,
+@@ -2475,7 +2471,7 @@ static int __init scsc_bt_module_init(void)
+ 		return ret;
+ 	}
+ 
+-	common_service.class = class_create(THIS_MODULE, "scsc_char");
++	common_service.class = class_create("scsc_char");
+ 	if (IS_ERR(common_service.class)) {
+ 		ret = PTR_ERR(common_service.class);
+ 		goto error;
+@@ -2563,16 +2559,6 @@ static int __init scsc_bt_module_init(void)
+ 	spin_lock_init(&bt_service.avdtp_detect.lock);
+ 	spin_lock_init(&bt_service.avdtp_detect.fw_write_lock);
+ 
+-#if defined(CONFIG_ARCH_EXYNOS) || defined(CONFIG_ARCH_EXYNOS9)
+-	sprintf(bluetooth_address_fallback, "%02X:%02X:%02X:%02X:%02X:%02X",
+-	       (exynos_soc_info.unique_id & 0x000000FF0000) >> 16,
+-	       (exynos_soc_info.unique_id & 0x00000000FF00) >> 8,
+-	       (exynos_soc_info.unique_id & 0x0000000000FF) >> 0,
+-	       (exynos_soc_info.unique_id & 0xFF0000000000) >> 40,
+-	       (exynos_soc_info.unique_id & 0x00FF00000000) >> 32,
+-	       (exynos_soc_info.unique_id & 0x0000FF000000) >> 24);
+-#endif
+-
+ #ifdef CONFIG_SCSC_ANT
+ 	SCSC_TAG_DEBUG(BT_COMMON, "dev=%u class=%p\n",
+ 			   ant_service.device, common_service.class);
+@@ -2598,24 +2584,13 @@ static void __exit scsc_bt_module_exit(void)
+ {
+ 	SCSC_TAG_INFO(BT_COMMON, "\n");
+ 
+-	wake_lock_destroy(&bt_service.write_wake_lock);
+-	wake_lock_destroy(&bt_service.read_wake_lock);
+-	wake_lock_destroy(&bt_service.service_wake_lock);
+-	complete_all(&bt_service.recovery_probe_complete);
+-	complete_all(&bt_service.recovery_release_complete);
+-
+-#ifdef CONFIG_SCSC_ANT
+-	wake_lock_destroy(&ant_service.write_wake_lock);
+-	wake_lock_destroy(&ant_service.read_wake_lock);
+-	wake_lock_destroy(&ant_service.service_wake_lock);
+-	complete_all(&ant_service.recovery_probe_complete);
+-	complete_all(&ant_service.recovery_release_complete);
+-	complete_all(&ant_service.release_complete);
+-#endif
+-
+ 	slsi_kic_bt_ops_unregister(&scsc_bt_kic_ops);
+ 
+-	/* Register with MX manager */
++	/*
++	 * Unregister with MX first.  This removes the HCI device, which closes
++	 * the controller and stops the BT service, so the wake locks below
++	 * must still be valid here.
++	 */
+ 	scsc_mx_module_unregister_client_module(&bt_driver);
+ 
+ 	if (bt_service.h4_device) {
+@@ -2645,6 +2620,27 @@ static void __exit scsc_bt_module_exit(void)
+ 
+ 	scsc_bt_qos_deinit();
+ 
++	complete_all(&bt_service.recovery_probe_complete);
++	complete_all(&bt_service.recovery_release_complete);
++
++	wake_lock_destroy(&bt_service.write_wake_lock);
++	wake_lock_destroy(&bt_service.read_wake_lock);
++	wake_lock_destroy(&bt_service.service_wake_lock);
++
++#ifdef CONFIG_SCSC_ANT
++	complete_all(&ant_service.recovery_probe_complete);
++	complete_all(&ant_service.recovery_release_complete);
++	complete_all(&ant_service.release_complete);
++	wake_lock_destroy(&ant_service.write_wake_lock);
++	wake_lock_destroy(&ant_service.read_wake_lock);
++	wake_lock_destroy(&ant_service.service_wake_lock);
++#endif
++
++	if (common_service.class) {
++		class_destroy(common_service.class);
++		common_service.class = NULL;
++	}
++
+ 	SCSC_TAG_INFO(BT_COMMON, "exit, module unloaded\n");
+ }
+ 
+diff --git a/bt/scsc_bt_priv.h b/bt/scsc_bt_priv.h
+index 0310869..7e6b8c9 100755
+--- a/bt/scsc_bt_priv.h
++++ b/bt/scsc_bt_priv.h
+@@ -58,12 +58,12 @@
+ #define HCI_EVENT_HARDWARE_ERROR_EVENT                  (0x10)
+ 
+ #define SCSC_BT_CONF      "bt.hcf"
+-#ifdef CONFIG_SCSC_BT_BLUEZ
+-#define SCSC_BT_ADDR      "/csa/bluetooth/.bd_addr"
+-#define SCSC_BT_ADDR_LEN  (3)
+-#elif defined CONFIG_SCSC_BT_ADDRESS_IN_FILE
++#if defined CONFIG_SCSC_BT_ADDRESS_IN_FILE
+ #define SCSC_BT_ADDR      CONFIG_SCSC_BT_ADDRESS_FILENAME
+ #define SCSC_BT_ADDR_LEN  (6)
++#elif defined CONFIG_SCSC_BT_BLUEZ
++#define SCSC_BT_ADDR      "/csa/bluetooth/.bd_addr"
++#define SCSC_BT_ADDR_LEN  (3)
+ #endif
+ 
+ #define SCSC_H4_DEVICE_NAME             "scsc_h4_0"
+@@ -235,6 +235,10 @@ struct scsc_bt_service {
+ 	atomic_t                       service_users;
+ 	bool                           service_started;
+ 
++	/* Set while the in-kernel BlueZ bridge moves H4 data, so the shared
++	 * memory helpers copy with memcpy() instead of the user accessors. */
++	bool                           kernel_io;
++
+ 	scsc_mifram_ref                bhcs_ref;                /* Bluetooth host configuration service reference */
+ 	scsc_mifram_ref                bsmhcp_ref;              /* Bluetooth shared memory host controller protocol reference */
+ 	scsc_mifram_ref                config_ref;              /* Bluetooth configuration reference */
+diff --git a/bt/scsc_bt_qos.c b/bt/scsc_bt_qos.c
+index 6eda55e..8c6ce9f 100644
+--- a/bt/scsc_bt_qos.c
++++ b/bt/scsc_bt_qos.c
+@@ -4,224 +4,35 @@
+  *
+  * Bluetooth Quality of Service
+  *
++ * Linux 7.3 port: the vendor PM QoS classes (device/bus throughput and
++ * cluster minimum frequency) are not part of mainline.  The shared-memory
++ * transport keeps calling these hooks, so they remain as no-ops instead of
++ * pulling the whole vendor interconnect framework into the port.
++ *
+  ****************************************************************************/
+-#include <linux/version.h>
+-#include <linux/init.h>
++
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
+-#include <linux/poll.h>
+-#include <linux/slab.h>
+-#include <linux/cdev.h>
+-#include <linux/device.h>
+-#include <linux/kthread.h>
+-#include <linux/proc_fs.h>
+-#include <linux/moduleparam.h>
+-#include <asm/io.h>
+-#include <asm/termios.h>
+-#include <linux/wakelock.h>
+-#include <linux/delay.h>
+-#include <linux/seq_file.h>
+-#include <linux/platform_device.h>
+-#include <linux/of.h>
+ 
+-#include <scsc/scsc_mx.h>
+-#include <scsc/scsc_mifram.h>
+-#include <scsc/api/bsmhcp.h>
+ #include <scsc/scsc_logring.h>
+ 
+ #include "scsc_bt_priv.h"
+ 
+-#define SCSC_QOS_OF_TABLE_LENGTH        (12)
+-
+-struct scsc_qos_of_table {
+-	u32 firmware_bus_high;
+-	u32 default_rx_throttle_bus;
+-	u32 default_rx_throttle_int;
+-	u32 default_rx_throttle_cluster1;
+-	u32 medium_rx_throttle_level;
+-	u32 medium_rx_throttle_bus;
+-	u32 medium_rx_throttle_int;
+-	u32 medium_rx_throttle_cluster1;
+-	u32 high_rx_throttle_level;
+-	u32 high_rx_throttle_bus;
+-	u32 high_rx_throttle_int;
+-	u32 high_rx_throttle_cluster1;
+-};
+-
+-static ulong pm_qos_int_value = PM_QOS_DEVICE_THROUGHPUT_DEFAULT_VALUE;
+-static ulong pm_qos_bus_value = PM_QOS_BUS_THROUGHPUT_DEFAULT_VALUE;
+-static ulong pm_qos_cluster0_freq_min_value = 0;
+-static ulong pm_qos_cluster1_freq_min_value = 0;
+-static struct scsc_qos_service qos_service;
+-static struct scsc_qos_of_table qos_of_table;
+-
+-static int pm_qos_set_param_cb(const char *buffer, const struct kernel_param *kp)
+-{
+-	int ret = param_set_ulong(buffer, kp);
+-	if (ret >= 0)
+-		schedule_work(&qos_service.work_queue);
+-
+-	return ret;
+-}
+-
+-static struct kernel_param_ops pm_qos_ops = {
+-	.set = pm_qos_set_param_cb,
+-	.get = param_get_ulong,
+-};
+-
+-module_param_cb(pm_qos_int, &pm_qos_ops, &pm_qos_int_value, S_IRUGO | S_IWUSR);
+-MODULE_PARM_DESC(pm_qos_int, "Device throughput");
+-
+-module_param_cb(pm_qos_bus, &pm_qos_ops, &pm_qos_bus_value, S_IRUGO | S_IWUSR);
+-MODULE_PARM_DESC(pm_qos_bus, "Bus throughput");
+-
+-module_param_cb(pm_qos_cluster0_freq_min,
+-		&pm_qos_ops,
+-		&pm_qos_cluster0_freq_min_value,
+-		S_IRUGO | S_IWUSR);
+-MODULE_PARM_DESC(pm_qos_cluster0_freq_min, "Cluster 0 minimum frequency");
+-
+-module_param_cb(pm_qos_cluster1_freq_min,
+-		&pm_qos_ops,
+-		&pm_qos_cluster1_freq_min_value,
+-		S_IRUGO | S_IWUSR);
+-MODULE_PARM_DESC(pm_qos_cluster1_freq_min, "Cluster 1 minimum frequency");
+-
+-void scsc_bt_qos_update(uint32_t number_of_outstanding_hci_events,
+-			uint32_t number_of_outstanding_acl_packets)
+-{
+-	if (qos_service.of_table_present) {
+-		int current_state = 0;
+-		int next_state = 0;
+-
+-		u32 current_level = max(qos_service.number_of_outstanding_acl_packets,
+-					qos_service.number_of_outstanding_hci_events);
+-		u32 next_level = max(number_of_outstanding_acl_packets,
+-				     number_of_outstanding_hci_events);
+-
+-		/* Calculate current and next PM state */
+-		if (current_level > qos_of_table.high_rx_throttle_level)
+-			current_state = 2;
+-		else if (current_level > qos_of_table.medium_rx_throttle_level)
+-			current_state = 1;
+-		if (next_level > qos_of_table.high_rx_throttle_level)
+-			next_state = 2;
+-		else if (next_level > qos_of_table.medium_rx_throttle_level)
+-			next_state = 1;
+-
+-		/* Save current levels */
+-		qos_service.number_of_outstanding_hci_events = number_of_outstanding_hci_events;
+-		qos_service.number_of_outstanding_acl_packets = number_of_outstanding_acl_packets;
+-
+-		/* Update PM QoS settings if state differs */
+-		if ((next_state > current_state) || (current_state > 0 && next_state == 0))
+-			schedule_work(&qos_service.work_queue);
+-	}
+-}
+-
+-void scsc_bt_qos_service_stop(void)
+-{
+-	/* Throttle down to minimum on Bluetooth service close */
+-	qos_service.number_of_outstanding_hci_events = 0;
+-	qos_service.number_of_outstanding_acl_packets = 0;
+-	if (qos_service.of_table_present)
+-		schedule_work(&qos_service.work_queue);
+-}
+-
+-static void scsc_bt_qos_work(struct work_struct *data)
+-{
+-	u32 pm_qos_int_max = max((u32)pm_qos_int_value, qos_of_table.default_rx_throttle_int);
+-	u32 pm_qos_bus_max = max((u32)pm_qos_bus_value, qos_of_table.default_rx_throttle_bus);
+-	u32 pm_qos_cluster1_freq_min = max((u32)pm_qos_cluster1_freq_min_value,
+-					   qos_of_table.default_rx_throttle_cluster1);
+-	u32 level = max(qos_service.number_of_outstanding_acl_packets,
+-			qos_service.number_of_outstanding_hci_events);
+-
+-	if (level > qos_of_table.high_rx_throttle_level) {
+-		pm_qos_int_max = max(pm_qos_int_max, qos_of_table.high_rx_throttle_int);
+-		pm_qos_bus_max = max(pm_qos_bus_max, qos_of_table.high_rx_throttle_bus);
+-		pm_qos_cluster1_freq_min = max(pm_qos_cluster1_freq_min,
+-					       qos_of_table.high_rx_throttle_cluster1);
+-	} else if (level > qos_of_table.medium_rx_throttle_level) {
+-		pm_qos_int_max = max(pm_qos_int_max, qos_of_table.medium_rx_throttle_int);
+-		pm_qos_bus_max = max(pm_qos_bus_max, qos_of_table.medium_rx_throttle_bus);
+-		pm_qos_cluster1_freq_min = max(pm_qos_cluster1_freq_min,
+-					       qos_of_table.medium_rx_throttle_cluster1);
+-	}
+-
+-	SCSC_TAG_DEBUG(BT_COMMON, "Bluetooth QoS update (Level: %u)\n", level);
+-
+-	pm_qos_update_request(&qos_service.pm_qos_int,
+-			      pm_qos_int_max);
+-	pm_qos_update_request(&qos_service.pm_qos_bus,
+-			      pm_qos_bus_max);
+-	pm_qos_update_request(&qos_service.pm_qos_cluster0_freq_min,
+-			      pm_qos_cluster0_freq_min_value);
+-	pm_qos_update_request(&qos_service.pm_qos_cluster1_freq_min,
+-			      pm_qos_cluster1_freq_min);
+-}
+-
+ void scsc_bt_qos_init(void)
+ {
+-	pm_qos_add_request(&qos_service.pm_qos_int,
+-			   PM_QOS_DEVICE_THROUGHPUT,
+-			   pm_qos_int_value);
+-	pm_qos_add_request(&qos_service.pm_qos_bus,
+-			   PM_QOS_BUS_THROUGHPUT,
+-			   pm_qos_bus_value);
+-	pm_qos_add_request(&qos_service.pm_qos_cluster0_freq_min,
+-			   PM_QOS_CLUSTER0_FREQ_MIN,
+-			   pm_qos_cluster0_freq_min_value);
+-	pm_qos_add_request(&qos_service.pm_qos_cluster1_freq_min,
+-			   PM_QOS_CLUSTER1_FREQ_MIN,
+-			   pm_qos_cluster1_freq_min_value);
+-
+-	INIT_WORK(&qos_service.work_queue, scsc_bt_qos_work);
++	SCSC_TAG_DEBUG(BT_COMMON, "QoS boosting not available on this kernel\n");
+ }
+ 
+ void scsc_bt_qos_deinit(void)
+ {
+-	pm_qos_remove_request(&qos_service.pm_qos_int);
+-	pm_qos_remove_request(&qos_service.pm_qos_bus);
+-	pm_qos_remove_request(&qos_service.pm_qos_cluster0_freq_min);
+-	pm_qos_remove_request(&qos_service.pm_qos_cluster1_freq_min);
+ }
+ 
+-static int scsc_bt_qos_probe(struct platform_device *pdev)
++void scsc_bt_qos_service_stop(void)
+ {
+-	int ret = 0;
+-	int len = of_property_count_u32_elems(pdev->dev.of_node, "bluetooth_qos");
+-
+-	if (len == SCSC_QOS_OF_TABLE_LENGTH) {
+-		ret = of_property_read_u32_array(pdev->dev.of_node,
+-						 "bluetooth_qos",
+-						 (u32*)&qos_of_table,
+-						 len);
+-		qos_service.of_table_present = (ret == 0);
+-	}
+-
+-	return 0;
+ }
+ 
+-static int scsc_bt_qos_remove(struct platform_device *pdev)
++void scsc_bt_qos_update(uint32_t number_of_outstanding_hci_events,
++			uint32_t number_of_outstanding_acl_packets)
+ {
+-	return 0;
+ }
+-
+-static const struct of_device_id scsc_bt_qos_match[] = {
+-	{ .compatible = "samsung,scsc_bt_qos", },
+-	{},
+-};
+-MODULE_DEVICE_TABLE(of, scsc_bt_qos_match);
+-
+-static struct platform_driver scsc_bt_qos_driver = {
+-	.probe          = scsc_bt_qos_probe,
+-	.remove         = scsc_bt_qos_remove,
+-	.driver         = {
+-		.name = "scsc_bt_qos",
+-		.owner = THIS_MODULE,
+-		.of_match_table = scsc_bt_qos_match,
+-	}
+-};
+-module_platform_driver(scsc_bt_qos_driver);
+diff --git a/bt/scsc_shm.c b/bt/scsc_shm.c
+index a29d692..21e01e9 100755
+--- a/bt/scsc_shm.c
++++ b/bt/scsc_shm.c
+@@ -40,6 +40,31 @@
+ #include "scsc_shm.h"
+ #include "scsc_bt_hci.h"
+ 
++/*
++ * The Android H4 character device serves user space, while the in-kernel
++ * BlueZ bridge calls the same shared-memory path with kernel buffers.  Both
++ * callers use one path, so switch the copy primitive depending on the caller.
++ */
++static inline unsigned long scsc_bt_copy_to_user(void *to,
++						 const void *from, size_t n)
++{
++	if (bt_service.kernel_io) {
++		memcpy(to, from, n);
++		return 0;
++	}
++	return copy_to_user(to, from, n);
++}
++
++static inline unsigned long scsc_bt_copy_from_user(void *to,
++						   const void *from, size_t n)
++{
++	if (bt_service.kernel_io) {
++		memcpy(to, from, n);
++		return 0;
++	}
++	return copy_from_user(to, from, n);
++}
++
+ struct hci_credit_entry {
+ 	u16 hci_connection_handle;
+ 	u16 credits;
+@@ -579,7 +604,7 @@ static ssize_t scsc_iq_report_evt_read(char __user *buf, size_t len)
+ 								bt_service.read_offset);
+ 
+ 	/* Copy the data to the user buffer */
+-	ret = copy_to_user(buf, &h4_iq_report_evt[bt_service.read_offset], len);
++	ret = scsc_bt_copy_to_user(buf, &h4_iq_report_evt[bt_service.read_offset], len);
+ 	if (ret == 0) {
+ 		/* All good - Update our consumed information */
+ 		bt_service.read_offset += len;
+@@ -625,7 +650,7 @@ static ssize_t scsc_hci_evt_read(char __user *buf, size_t len)
+ 		}
+ 
+ 		/* Store the H4 header in the user buffer */
+-		ret = copy_to_user(buf, &h4_hci_event_header, sizeof(h4_hci_event_header));
++		ret = scsc_bt_copy_to_user(buf, &h4_hci_event_header, sizeof(h4_hci_event_header));
+ 		if (0 == ret) {
+ 			/* All good - Update our consumed information */
+ 			consumed = sizeof(h4_hci_event_header);
+@@ -642,7 +667,7 @@ static ssize_t scsc_hci_evt_read(char __user *buf, size_t len)
+ 		len = min((td->length - (bt_service.read_offset - sizeof(h4_hci_event_header))), (len - consumed));
+ 
+ 		/* Copy the data to the user buffer */
+-		ret = copy_to_user(&buf[consumed], &td->data[bt_service.read_offset - sizeof(h4_hci_event_header)], len);
++		ret = scsc_bt_copy_to_user(&buf[consumed], &td->data[bt_service.read_offset - sizeof(h4_hci_event_header)], len);
+ 		if (0 == ret) {
+ 			/* All good - Update our consumed information */
+ 			bt_service.read_offset += len;
+@@ -672,7 +697,7 @@ static ssize_t scsc_hci_evt_error_read(char __user *buf, size_t len)
+ 	len = min(sizeof(h4_hci_event_hardware_error) - bt_service.read_offset, len);
+ 
+ 	/* Copy the data to the user buffer */
+-	ret = copy_to_user(buf, &h4_hci_event_hardware_error[bt_service.read_offset], len);
++	ret = scsc_bt_copy_to_user(buf, &h4_hci_event_hardware_error[bt_service.read_offset], len);
+ 	if (0 == ret) {
+ 		/* All good - Update our consumed information */
+ 		bt_service.read_offset += len;
+@@ -721,7 +746,7 @@ static ssize_t scsc_acl_read(char __user *buf, size_t len)
+ 		h4_acl_header[4] = (td->length & 0xff00) >> 8;
+ 
+ 		/* Copy the H4 header + ACL data header to the userspace buffer */
+-		ret = copy_to_user(buf, &h4_acl_header[bt_service.read_offset], copy_len);
++		ret = scsc_bt_copy_to_user(buf, &h4_acl_header[bt_service.read_offset], copy_len);
+ 		if (0 == ret) {
+ 			/* All good - Update our consumed information */
+ 			consumed = copy_len;
+@@ -738,7 +763,7 @@ static ssize_t scsc_acl_read(char __user *buf, size_t len)
+ 		copy_len = min((td->length - (bt_service.read_offset - sizeof(h4_acl_header))), (len - consumed));
+ 
+ 		/* Copy the data to the user buffer */
+-		ret = copy_to_user(&buf[consumed], &td->data[bt_service.read_offset - sizeof(h4_acl_header)], copy_len);
++		ret = scsc_bt_copy_to_user(&buf[consumed], &td->data[bt_service.read_offset - sizeof(h4_acl_header)], copy_len);
+ 		if (0 == ret) {
+ 			/* All good - Update our consumed information */
+ 			bt_service.read_offset += copy_len;
+@@ -778,7 +803,7 @@ static ssize_t scsc_acl_credit(char __user *buf, size_t len)
+ 	len = min(h4_hci_event_ncp_header_len - bt_service.read_offset, len);
+ 
+ 	/* Copy the data to the user buffer */
+-	ret = copy_to_user(buf, &h4_hci_event_ncp_header[bt_service.read_offset], len);
++	ret = scsc_bt_copy_to_user(buf, &h4_hci_event_ncp_header[bt_service.read_offset], len);
+ 	if (0 == ret) {
+ 		/* All good - Update our consumed information */
+ 		bt_service.read_offset += len;
+@@ -1234,7 +1259,7 @@ ssize_t scsc_bt_shm_h4_queue_sync_helper(char __user *buf, size_t len)
+ 	return ret;
+ }
+ 
+-ssize_t scsc_bt_shm_h4_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
++static ssize_t __scsc_bt_shm_h4_read(struct file *file, char __user *buf, size_t len)
+ {
+ 	ssize_t consumed = 0;
+ 	ssize_t ret = 0;
+@@ -1298,7 +1323,7 @@ ssize_t scsc_bt_shm_h4_read(struct file *file, char __user *buf, size_t len, lof
+ 		    0 == atomic_read(&bt_service.error_count) &&
+ 		    0 == bt_service.bsmhcp_protocol->header.panic_deathbed_confession) {
+ 			/* Don't wait if in NONBLOCK mode */
+-			if (file->f_flags & O_NONBLOCK) {
++			if (file && (file->f_flags & O_NONBLOCK)) {
+ 				ret = -EAGAIN;
+ 				break;
+ 			}
+@@ -1477,7 +1502,18 @@ ssize_t scsc_bt_shm_h4_read(struct file *file, char __user *buf, size_t len, lof
+ 	return 0 == ret ? consumed : ret;
+ }
+ 
+-ssize_t scsc_bt_shm_h4_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
++ssize_t scsc_bt_shm_h4_read(struct file *file, char __user *buf, size_t len,
++			    loff_t *offset)
++{
++	return __scsc_bt_shm_h4_read(file, buf, len);
++}
++
++ssize_t scsc_bt_shm_h4_read_kernel(u8 *buf, size_t len)
++{
++	return __scsc_bt_shm_h4_read(NULL, (char __user *)buf, len);
++}
++
++static ssize_t __scsc_bt_shm_h4_write(const char __user *buf, size_t count)
+ {
+ 	size_t  length;
+ 	size_t  hci_pkt_len;
+@@ -1486,9 +1522,6 @@ ssize_t scsc_bt_shm_h4_write(struct file *file, const char __user *buf, size_t c
+ 
+ 	SCSC_TAG_DEBUG(BT_H4, "enter\n");
+ 
+-	UNUSED(file);
+-	UNUSED(offset);
+-
+ 	/* Don't allow any writes after service has been closed */
+ 	if (!bt_service.service_started)
+ 		return -EIO;
+@@ -1520,7 +1553,7 @@ ssize_t scsc_bt_shm_h4_write(struct file *file, const char __user *buf, size_t c
+ 		}
+ 
+ 		/* Copy the userspace data to the target buffer */
+-		ret = copy_from_user(&h4_write_buffer[bt_service.h4_write_offset], &buf[written], length);
++		ret = scsc_bt_copy_from_user(&h4_write_buffer[bt_service.h4_write_offset], &buf[written], length);
+ 		if (0 == ret) {
+ 			/* Is there enough data to include a HCI command header and is the type a HCI_COMMAND_PKT */
+ 			if ((length + bt_service.h4_write_offset) >= H4DMUX_HEADER_HCI && HCI_COMMAND_PKT == h4_write_buffer[0]) {
+@@ -1594,6 +1627,17 @@ ssize_t scsc_bt_shm_h4_write(struct file *file, const char __user *buf, size_t c
+ 	return 0 == ret ? written : ret;
+ }
+ 
++ssize_t scsc_bt_shm_h4_write(struct file *file, const char __user *buf,
++			     size_t count, loff_t *offset)
++{
++	return __scsc_bt_shm_h4_write(buf, count);
++}
++
++ssize_t scsc_bt_shm_h4_write_kernel(const u8 *buf, size_t count)
++{
++	return __scsc_bt_shm_h4_write((const char __user *)buf, count);
++}
++
+ unsigned scsc_bt_shm_h4_poll(struct file *file, poll_table *wait)
+ {
+ 	/* Add the wait queue to the polling queue */
+diff --git a/bt/scsc_shm.h b/bt/scsc_shm.h
+index 6b98e7d..25aaf60 100644
+--- a/bt/scsc_shm.h
++++ b/bt/scsc_shm.h
+@@ -23,6 +23,10 @@ ssize_t scsc_bt_shm_h4_write(struct file *file,
+ 			     size_t len, loff_t *offset);
+ unsigned scsc_bt_shm_h4_poll(struct file *file, poll_table *wait);
+ 
++/* In-kernel bridge used by the BlueZ integration. */
++ssize_t scsc_bt_shm_h4_read_kernel(u8 *buf, size_t len);
++ssize_t scsc_bt_shm_h4_write_kernel(const u8 *buf, size_t len);
++
+ /* ANT specific functions */
+ int scsc_ant_shm_init(void);
+ void scsc_ant_shm_exit(void);
+diff --git a/gta4xl.h b/gta4xl.h
+index 43f8e96..f73e928 100644
+--- a/gta4xl.h
++++ b/gta4xl.h
+@@ -12,6 +12,10 @@
+ #define CONFIG_SCSC_PLATFORM 1
+ #define CONFIG_SCSC_WLAN 1
+ #define CONFIG_SCSC_COMMON_HCF 1
++#define CONFIG_SCSC_BT 1
++#define CONFIG_SCSC_BT_BLUEZ 1
++#define CONFIG_SCSC_BT_ADDRESS_IN_FILE 1
++#define CONFIG_SCSC_BT_ADDRESS_FILENAME "samsung/gta4xl/bt_addr"
+ #define CONFIG_SCSC_WLAN_STA_ONLY 1
+ #define CONFIG_SCSC_WLAN_SAE_CONFIG 1
+ #define CONFIG_SCSC_WLAN_MAX_INTERFACES 3

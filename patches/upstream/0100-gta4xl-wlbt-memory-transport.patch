@@ -1,0 +1,60 @@
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-peripherals.dts
+@@ -207,3 +207,5 @@
+ 		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
+ 	};
+ };
++
++#include "exynos9610-gta4xl-wifi.dtsi"
+--- a/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-wifi.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos9610-gta4xl-wifi.dtsi
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Exynos9610 shared-memory WLAN transport, matching the SM-P615 live DT. */
++/ {
++    reserved-memory {
++        wlbt_reserved: wifi@fc000000 {
++            reg = <0 0xfc000000 0x1000000>;
++            no-map;
++        };
++    };
++};
++
++&soc {
++    wlbt_baaw: syscon@12050000 {
++        compatible = "samsung,exynos9610-wlbt-baaw", "syscon";
++        reg = <0x12050000 0x100>;
++    };
++    wlbt_dbus: syscon@14c20000 {
++        compatible = "samsung,exynos9610-wlbt-dbus", "syscon";
++        reg = <0x14c20000 0x300>;
++    };
++    wlbt_pbus: syscon@14c30000 {
++        compatible = "samsung,exynos9610-wlbt-pbus", "syscon";
++        reg = <0x14c30000 0x300>;
++    };
++    wlbt_remap: syscon@14c50000 {
++        compatible = "samsung,exynos9610-wlbt-remap", "syscon";
++        reg = <0x14c50000 0x300>;
++    };
++    wlbt_boot: syscon@14c60000 {
++        compatible = "samsung,exynos9610-wlbt-boot", "syscon";
++        reg = <0x14c60000 0x1200>;
++    };
++    wifi: wifi@119c0000 {
++        compatible = "samsung,scsc_wifibt";
++        reg = <0x119c0000 0x180>;
++        interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>;
++        interrupt-names = "MBOX", "ALIVE", "WDOG", "CFG_REQ";
++        memory-region = <&wlbt_reserved>;
++        samsung,syscon-phandle = <&pmu>;
++        samsung,baaw_p_wlbt-syscon-phandle = <&wlbt_baaw>;
++        samsung,dbus_baaw-syscon-phandle = <&wlbt_dbus>;
++        samsung,pbus_baaw-syscon-phandle = <&wlbt_pbus>;
++        samsung,wlbt_remap-syscon-phandle = <&wlbt_remap>;
++        samsung,boot_cfg-syscon-phandle = <&wlbt_boot>;
++    };
++};

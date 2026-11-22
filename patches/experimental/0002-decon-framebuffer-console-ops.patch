@@ -1,0 +1,11 @@
+--- a/drivers/video/fbdev/exynos/dpu20/decon_core.c
++++ b/drivers/video/fbdev/exynos/dpu20/decon_core.c
+@@ -3216,6 +3216,8 @@
+ 	.fb_blank	= decon_blank,
+ 	.fb_setcolreg	= decon_setcolreg,
+ 	.fb_fillrect    = cfb_fillrect,
++	.fb_copyarea    = cfb_copyarea,
++	.fb_imageblit   = cfb_imageblit,
+ #ifdef CONFIG_COMPAT
+ 	.fb_compat_ioctl = decon_compat_ioctl,
+ #endif
