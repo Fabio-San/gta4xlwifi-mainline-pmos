@@ -31,6 +31,13 @@ bash scripts/setup-build-env.sh
 applies patches from `patches/upstream/` and `patches/upstream-wifi/`, and verifies
 patch hashes (`import-sha256.json`).
 
+Required build files (all included in this repo): `tools/upstream-init-aarch64`
+(the original `pmos-init`, SHA256 `2f87e1be…`), `tools/hwctl-aarch64`,
+`tools/busybox-aarch64`, `tools/adbd-aarch64`, `tools/setup-rndis.sh`,
+`scripts/build.py`, `scripts/upstream/init` and `scripts/upstream/desktop-test`.
+`build-upstream.py` downloads the pinned kernel tarball and UniLoader automatically
+and creates `sources/` on first run.
+
 Manual clone:
 
 ```bash

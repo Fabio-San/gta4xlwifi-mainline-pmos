@@ -19,7 +19,9 @@ The rootfs is **rebuilt clean**, not copied from a personal backup.
 - Standard empty directories: `Desktop/`, `Downloads/`, `Music/`, `Pictures/`,
   `Templates/`, `Videos/` (structure only, no user files)
 - Hardware firmware: `mx140`, `calliope_*`, `AP_*_AUDIO_SLSI`, ACPM plugins
-- Kernel modules for `7.3.0-gta4xl-upstream`
+- Kernel modules for `7.3.0-gta4xl-upstream` (if found at build time). The 7.3 config
+  is effectively monolithic — all display/audio/WiFi drivers are built-in (`=y`);
+  only 8 optional symbols are `=m`, so a module-free rootfs still boots correctly.
 - Base XFCE configuration (theme, panel, `modesetting`, `DRI 3`, `PageFlip false`)
 - `onboard` virtual keyboard with large keys, auto-started
 - SSH server installed but **disabled**

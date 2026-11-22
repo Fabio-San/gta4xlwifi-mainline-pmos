@@ -9,6 +9,8 @@
 | `tools/busybox-aarch64` | GPL-2.0 | BusyBox. |
 | `tools/adbd-aarch64` | Apache-2.0 | Android adbd. |
 | `tools/setup-rndis.sh` | MIT | From the gta4xl bring-up scripts. |
+| `tools/hwctl-aarch64` | GPL-2.0 | Hardware control helper from the bring-up tree. |
+| `scripts/build.py`, `scripts/upstream/init`, `scripts/upstream/desktop-test` | MIT | Build/initramfs helpers from the gta4xl bring-up tree. |
 
 ## Attribution
 

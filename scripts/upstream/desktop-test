@@ -1,0 +1,49 @@
+#!/bin/busybox sh
+# Run the installed Alpine desktop with all changes confined to RAM.
+set -eu
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+say() { echo "gta4xl-upstream: $*" >/dev/kmsg; }
+trap 'status=$?; [ "$status" -eq 0 ] || say "ALPINE_DESKTOP_FAILED status=$status; inspect /run/desktop-setup.log"' EXIT
+expected=0937c8d6-ec48-47e7-9dd6-15c5cde2e2dd
+[ "$(blkid /dev/mmcblk0 | sed -n 's/.* UUID="\([^"]*\)".*/\1/p')" = "$expected" ]
+blockdev --setro /dev/mmcblk0
+mkdir -p /run/alpine-lower /run/alpine-upper /run/alpine-work /run/alpine-root
+mount -t ext4 -o ro,noload /dev/mmcblk0 /run/alpine-lower
+[ "$(cat /run/alpine-lower/etc/gta4xl-root-id)" = "$expected" ]
+[ -e /run/alpine-lower/.gta4xl-root-ready ]
+mount -t overlay overlay -o lowerdir=/run/alpine-lower,upperdir=/run/alpine-upper,workdir=/run/alpine-work /run/alpine-root
+root=/run/alpine-root
+for dir in dev proc sys run tmp; do mkdir -p "$root/$dir"; done
+for dir in dev proc sys; do mount -o bind "/$dir" "$root/$dir"; done
+mount -t tmpfs -o mode=0755 tmpfs "$root/run"
+mount -t tmpfs -o mode=1777 tmpfs "$root/tmp"
+mkdir -p "$root/dev/pts"
+mount -t devpts -o mode=0620,ptmxmode=0666 devpts "$root/dev/pts"
+cat >"$root/etc/X11/xorg.conf.d/92-mainline-himax.conf" <<'XORG'
+Section "InputClass"
+    Identifier "Mainline Himax touchscreen landscape"
+    MatchProduct "Himax HX83102E"
+    MatchIsTouchscreen "on"
+    Driver "libinput"
+    Option "CalibrationMatrix" "0 1 0 -1 0 1 0 0 1"
+EndSection
+XORG
+say 'ALPINE_OVERLAY_READY; SD is read-only, upper layer is RAM.'
+chroot "$root" /bin/sh -s >"$root/run/desktop.log" 2>&1 <<'ALPINE'
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root TERM=linux
+hostname gta4xl-upstream
+ip link set lo up
+mkdir -p /run/user/1000 /tmp/.ICE-unix /run/dbus /var/lib/dbus
+chown linux:linux /run/user/1000
+chmod 700 /run/user/1000
+chmod 1777 /tmp/.ICE-unix
+udevd --daemon
+udevadm trigger --action=add
+udevadm settle --timeout=10 || true
+dbus-uuidgen --ensure=/etc/machine-id
+dbus-daemon --system --fork --nopidfile
+echo 'gta4xl-upstream: ALPINE_DESKTOP_START' >/dev/kmsg
+exec xinit /bin/su linux -c /usr/local/sbin/desktop-session -- \
+    /usr/bin/Xorg :0 -nolisten tcp -noreset -logfile /run/Xorg.0.log
+ALPINE

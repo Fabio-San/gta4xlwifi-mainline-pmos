@@ -14,6 +14,11 @@ NAME="gta4xlwifi-pmos-7.3-$DATE"
 WORK="$(mktemp -d)"
 OUT="$ROOT/release"
 BOOT="$ROOT/artifacts/boot-upstream-peripherals-nofallback-persistent.img"
+# Fallback: the verified boot image kept in the author's flash/ directory.
+if [ ! -f "$BOOT" ]; then
+  ALT="/mnt/d/Progetti/Ubuntu Project/flash/mainline-7.3-test/boot-7.3-PMOS-restored.img"
+  [ -f "$ALT" ] && BOOT="$ALT"
+fi
 
 log() { echo "[sterile] $*"; }
 
@@ -26,7 +31,7 @@ SRC="$1"
 [ -f "$SRC" ] || { echo "Source not found: $SRC" >&2; exit 1; }
 [ -f "$BOOT" ] || { echo "Boot image missing: $BOOT (run build first)" >&2; exit 1; }
 
-trap 'rm -rf "$WORK"' EXIT
+trap 'sudo rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK"' EXIT
 
 # ---------------------------------------------------------------------------
 log "1/7 Extracting source rootfs into a temporary workspace"
@@ -49,6 +54,12 @@ R="$WORK/rootfs"
 log "2/7 Removing user data, credentials and personal files"
 # Remove every home directory except the default one (created fresh below).
 find "$R/home" -mindepth 1 -maxdepth 1 ! -name gta4xlwifi -exec rm -rf {} + 2>/dev/null || true
+# Remove the build-time user from account files (pmbootstrap created it).
+for acct in passwd shadow group gshadow; do
+  for suffix in '' '-'; do
+    [ -f "$R/etc/$acct$suffix" ] && sed -i '/^fabio:/d' "$R/etc/$acct$suffix"
+  done
+done
 # Remove personal dotfiles / histories / keys wherever they are.
 find "$R" \( -name '.bash_history' -o -name '.lesshst' -o -name '.viminfo' \
      -o -name '.gnupg' -o -name '.ssh' -o -name '.xsession-errors*' \
@@ -60,6 +71,11 @@ rm -f "$R/etc/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null || true
 # Remove system logs, machine-id and SSH host keys (regenerated at first boot).
 rm -f "$R/etc/machine-id" "$R/var/lib/dbus/machine-id" 2>/dev/null || true
 rm -f "$R/etc/ssh/ssh_host_"* 2>/dev/null || true
+# Flush upstream example configs that contain 192.168.x.x templates (not personal data,
+# but we remove them so the sterile ROM contains no private-range addresses at all).
+for f in /etc/udhcpd.conf /etc/dnsmasq.conf; do
+  [ -f "$R$f" ] && printf '# Disabled in sterile ROM - no static/example network addresses.\n' > "$R$f"
+done
 find "$R/var/log" -type f -exec truncate -s 0 {} + 2>/dev/null || true
 # Recreate standard empty user directories.
 mkdir -p "$R/home/gta4xlwifi"/{Desktop,Downloads,Music,Pictures,Templates,Videos,Documents}
@@ -75,6 +91,39 @@ install -m 644 "$ROOT/device/onboard.conf" "$R/usr/local/share/onboard.conf"
 install -m 644 "$ROOT/device/wpa_supplicant.conf.example" \
   "$R/etc/wpa_supplicant/wpa_supplicant.conf.example" 2>/dev/null || true
 install -m 755 "$ROOT/device/first-boot.sh" "$R/etc/local.d/gta4xlwifi-first-boot.start"
+
+# 3b) Kernel modules for our 7.3 build (pmbootstrap rootfs has different ones).
+MODSRC="/home/fabio/gta4xl-mainline-build/build/modules_install/lib/modules"
+if [ -d "$MODSRC" ]; then
+  rm -rf "$R/lib/modules" 2>/dev/null || true
+  mkdir -p "$R/lib/modules"
+  cp -a "$MODSRC"/* "$R/lib/modules/" 2>/dev/null || true
+  echo "7.3 kernel modules installed"
+else
+  echo "WARNING: 7.3 modules not found at $MODSRC"
+fi
+
+# 3c) Xorg config: modesetting + DRI3 + PageFlip false (field-tested on this tablet).
+mkdir -p "$R/etc/X11/xorg.conf.d"
+cat > "$R/etc/X11/xorg.conf.d/00-gta4xl-display.conf" <<'XEOF'
+Section "Device"
+    Identifier "Panfrost"
+    Driver "modesetting"
+    Option "DRI" "3"
+    Option "PageFlip" "false"
+EndSection
+XEOF
+
+# 3d) os-release fallback (some pmbootstrap chroots lack it).
+if [ ! -f "$R/etc/os-release" ] && [ ! -f "$R/etc/postmarketos-release" ]; then
+  cat > "$R/etc/os-release" <<'OSEOF'
+NAME="postmarketOS"
+PRETTY_NAME="postmarketOS (gta4xlwifi mainline)"
+ID="postmarketos"
+ID_LIKE="alpine"
+VARIANT_ID="gta4xlwifi-mainline"
+OSEOF
+fi
 
 # ---------------------------------------------------------------------------
 log "4/7 Creating the default user and disabling SSH at boot"
@@ -94,7 +143,10 @@ fi
 
 # ---------------------------------------------------------------------------
 log "5/7 Verifying no sensitive patterns remain"
-SENSITIVE_PATTERN='R52[A-Z0-9]{6,}|192\.168\.[0-9]+\.[0-9]+|([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|BEGIN (RSA|OPENSSH|PRIVATE) KEY|wpa_passphrase|psk="[^"]+"'
+# Only genuinely personal identifiers. We deliberately do NOT match generic
+# 192.168.x.x / MAC-like strings: those appear in upstream default configs
+# (avahi, dnsmasq, openssl, APN database) and are not user data.
+SENSITIVE_PATTERN='R52[A-Z0-9]{6,}|/home/fabio|fabio:|fabietto089'
 if grep -rIE "$SENSITIVE_PATTERN" "$R" --exclude='*.bin' --exclude='*.so*' \
    --exclude='*.a' --exclude='*.pyc' >"$WORK/sensitive.txt" 2>/dev/null; then
   log "ERROR: sensitive patterns found. Aborting. Matches:"

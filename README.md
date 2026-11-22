@@ -20,22 +20,26 @@ This repository contains:
 
 ## What works (field-verified)
 
-| Feature | Status | Notes |
+| Feature | Status | Notes / details |
 |---|---|---|
 | Mainline 7.3 boot via uniLoader | ✅ | no bootloader / vbmeta flashing |
 | XFCE UI (modesetting + Panfrost) | ✅ | DRI3, DPU zero-copy |
 | WiFi | ✅ | `scsc_wlbt` driver, `mx140` firmware |
-| Stereo speaker audio (TAS2562) | ✅ | AABox/UAIF0 |
-| Headphone jack | ⚠️ | UAIF0 branch, never physically tested with headphones |
+| Stereo speaker audio (TAS2562) | ✅ | AABox/UAIF0 — [ROADMAP §4](docs/ROADMAP.md#4-audio--playback-already-works-polish-and-verification) |
+| Headphone jack | ⚠️ | UAIF0 branch, never physically tested — [ROADMAP §4](docs/ROADMAP.md#4-audio--playback-already-works-polish-and-verification) |
 | Network / SSH | ✅ | **disabled by default**, can be enabled (see below) |
 | Poweroff / reboot | ✅ | PS_HOLD |
 | Persistent volume, clock | ✅ | |
 | Touchscreen | ✅ | Himax HX83102E over SPI |
 | Battery / charging | ✅ | |
-| **GPU / video smoothness** | ⚠️ | Panfrost + zero-copy work, but YouTube/Chromium still not smooth |
-| **Native microphone** | ❌ | requires Calliope/DSP firmware, unavailable |
-| **MFC (HW video decode)** | ❌ | mainline driver probes, firmware incompatible; **disabled in DTS** |
-| **Bluetooth** | ❌ | needs the `scsc_bt` driver, not ported |
+| **GPU / video smoothness** | ⚠️ | Panfrost + zero-copy work, not smooth on YouTube — [ROADMAP §3](docs/ROADMAP.md#3-gpu--full-acceleration-encoding--metal--video) |
+| **Native microphone** | ❌ | needs Calliope/DSP firmware — [ROADMAP §2](docs/ROADMAP.md#2-microphone-native-capture--calliope-dsp) |
+| **MFC (HW video decode/encode)** | ❌ | firmware incompatible, disabled in DTS — [ROADMAP §3](docs/ROADMAP.md#3-gpu--full-acceleration-encoding--metal--video) |
+| **Bluetooth** | ❌ | needs `scsc_bt` driver port — [ROADMAP §1](docs/ROADMAP.md#1-bluetooth--scsc_bt-driver-port) |
+
+For the full action plan with evidence and steps, see [ROADMAP.md](docs/ROADMAP.md)
+([Italiano](docs/ROADMAP.it.md)). Current limitations: [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
+MMIO map: [HARDWARE.md](docs/HARDWARE.md).
 
 ---
 

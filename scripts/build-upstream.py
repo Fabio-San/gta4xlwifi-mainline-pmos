@@ -46,6 +46,7 @@ def apply(src, patch):
 
 
 def prepare():
+    (ROOT/'sources').mkdir(parents=True, exist_ok=True)
     marker = SRC/'.gta4xl-series-sha256'
     if SRC.exists():
         if not marker.exists() or marker.read_text().strip() != series_sha():
