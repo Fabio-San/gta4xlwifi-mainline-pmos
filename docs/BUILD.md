@@ -19,6 +19,13 @@ sudo apt install -y git python3 build-essential crossbuild-essential-arm64 \
   clang lld llvm bison flex libssl-dev
 ```
 
+If your distro provides only a versioned clang (e.g. `clang-21`), make sure an
+unversioned `clang` and `ld.lld` exist on PATH (the build uses `LLVM=1`):
+```bash
+sudo ln -sf /usr/bin/clang-21 /usr/local/bin/clang
+sudo ln -sf /usr/bin/ld.lld-21 /usr/local/bin/ld.lld
+```
+
 > **Important**: clone/build in a directory whose path contains **no spaces**.
 > The kernel Makefile's `O=` output handling breaks on paths with spaces
 > (e.g. `Ubuntu Project`). Use something like `~/gta4xlwifi-mainline-pmos`.
