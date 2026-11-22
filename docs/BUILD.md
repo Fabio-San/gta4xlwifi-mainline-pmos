@@ -15,8 +15,13 @@ This document explains how to rebuild the `boot.img` used on gta4xlwifi from scr
 ```bash
 sudo apt update
 sudo apt install -y git python3 build-essential crossbuild-essential-arm64 \
-  device-tree-compiler cpio gzip xz-utils curl wget openssl
+  device-tree-compiler cpio gzip xz-utils curl wget openssl \
+  clang lld llvm bison flex libssl-dev
 ```
+
+> **Important**: clone/build in a directory whose path contains **no spaces**.
+> The kernel Makefile's `O=` output handling breaks on paths with spaces
+> (e.g. `Ubuntu Project`). Use something like `~/gta4xlwifi-mainline-pmos`.
 
 ## 1. Workspace setup
 

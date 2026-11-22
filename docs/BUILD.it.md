@@ -6,8 +6,11 @@ Versione primaria: [BUILD.md](BUILD.md)
 WSL2/Ubuntu o Linux x86_64, ~10 GB liberi, strumenti:
 ```bash
 sudo apt install -y git python3 build-essential crossbuild-essential-arm64 \
-  device-tree-compiler cpio gzip xz-utils curl wget openssl
+  device-tree-compiler cpio gzip xz-utils curl wget openssl \
+  clang lld llvm bison flex libssl-dev
 ```
+
+> **Importante**: clonare/buildare in una cartella il cui percorso **non contenga spazi** (es. `~/gta4xlwifi-mainline-pmos`). Il Makefile del kernel con `O=` non gestisce i percorsi con spazi.
 
 ## Setup
 ```bash
