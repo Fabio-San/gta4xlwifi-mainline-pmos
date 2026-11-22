@@ -1,4 +1,4 @@
-# Build outputs (downloaded/generated trees), but KEEP the ACPM firmware sources
+# Build outputs (downloaded/generated trees)
 artifacts/
 sources/linux-7.3/
 sources/uniLoader/
@@ -30,3 +30,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# KEEP: pinned header-template images required for reproducible boot rebuild
+!backups/upstream/boot-before-upstream.img
+!backups/upstream/recovery-before-upstream.img
