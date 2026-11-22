@@ -1,6 +1,8 @@
-# Build outputs
+# Build outputs (downloaded/generated trees), but KEEP the ACPM firmware sources
 artifacts/
-sources/
+sources/linux-7.3/
+sources/uniLoader/
+sources/linux-*.tar.xz
 build/
 build-*/
 out/
