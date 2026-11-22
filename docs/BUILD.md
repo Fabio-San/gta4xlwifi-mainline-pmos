@@ -106,7 +106,19 @@ It contains `pmos-init-aarch64` with SHA256:
 2f87e1be573923cd333700ba9f8c1959d7cdbcce0656bcaa7b2aeb81462052b8
 ```
 
-## 5. Known build issues
+## 5. Verified reproducible build (external user test)
+
+This build was tested from a **clean clone** on WSL (kernel tarball + UniLoader
+downloaded automatically, all patches applied, DTS verified MFC-free, kernel
+compiled with clang/LLVM, boot.img repacked). It completes successfully and
+produces `artifacts/boot-upstream-peripherals-nofallback-persistent.img`.
+
+> The SHA256 will **not** be byte-identical to the released boot image
+> (`d71a7d11…`): kernel `utsversion.h`, CPIO timestamps and build paths change on
+> every build. Structure and functionality are equivalent; verify the image boots
+> on your device before trusting it.
+
+## 6. Known build issues
 
 - **"Failed to write database /usr/lib/udev/hwdb.bin: Function not implemented"**:
   benign error inside a WSL chroot; does not block the build.

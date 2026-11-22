@@ -256,6 +256,7 @@ def main():
         image = image.with_name(image.stem+'-nofallback.img')
     if args.persistent:
         image = image.with_name(image.stem+'-persistent.img')
+    image.parent.mkdir(parents=True, exist_ok=True)
     run([magiskboot, 'repack', backup, image], cwd=work)
     # size check relaxed for test image (ours is smaller than 59MiB partition)
     manifest = {

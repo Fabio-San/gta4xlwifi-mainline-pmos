@@ -38,6 +38,10 @@ sha256sum artifacts/boot-upstream-peripherals-nofallback-persistent.img
 ```
 SHA atteso: `d71a7d110e93ca35aecbcc51baa72f1daf0eb39fc5fa7e38a38f2a3bda5f1212`
 
+## Build verificato (test utente esterno)
+Testato da clone pulito su WSL: kernel + UniLoader scaricati, patch applicate, DTS senza MFC, kernel compilato con clang/LLVM, boot.img impacchettato — **completato con successo**.
+> Lo SHA256 non sarà byte-identico al boot rilasciato (`d71a7d11…`): timestamp kernel/CPIO e percorsi cambiano ad ogni build. Struttura e funzionalità sono equivalenti.
+
 ## Note
 - L'init è **embedded nel kernel** tramite uniLoader: modificare il ramdisk esterno non serve.
 - Se il boot spamma `s5p_mfc_wait_for_done_dev`, esegui `reapply-kernel-patches.sh`.
