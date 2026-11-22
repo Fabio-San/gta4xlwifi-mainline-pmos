@@ -47,6 +47,8 @@ Flash da Windows in Lineage Recovery:
 
 ROM sterile: `bash scripts/make-sterile-rom.sh`
 
+ROM precompilata: [Release v7.3-pmos-20261122](https://github.com/Fabio-San/gta4xlwifi-mainline-pmos/releases/tag/v7.3-pmos-20261122) — `gta4xlwifi-pmos-7.3-20261122.zip`, SHA256 `f1ed8fb1e823bf52646d033e2a6c989b24b30d5505b3b93ef8d199c245f8e27c`. Verificare il checksum prima di flashare.
+
 ---
 
 ## ROM sterile — account e SSH

@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATE="$(date +%Y%m%d)"
 NAME="gta4xlwifi-pmos-7.3-$DATE"
 WORK="$(mktemp -d)"
-OUT="$ROOT/release"
+OUT="$ROOT/dist"
 BOOT="$ROOT/artifacts/boot-upstream-peripherals-nofallback-persistent.img"
 # Fallback: the verified boot image kept in the author's flash/ directory.
 if [ ! -f "$BOOT" ]; then

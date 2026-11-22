@@ -74,6 +74,11 @@ bash scripts/make-sterile-rom.sh /path/to/local-rootfs-backup.tar.gz
 The zip is **not committed to git**: it is published as a GitHub **Release** with a
 tag such as `v7.3-pmos-YYYYMMDD`. The repository only holds sources, scripts and docs.
 
+Prebuilt sterile ROM: [Release v7.3-pmos-20261122](https://github.com/Fabio-San/gta4xlwifi-mainline-pmos/releases/tag/v7.3-pmos-20261122)
+(`gta4xlwifi-pmos-7.3-20261122.zip`, SHA256 `f1ed8fb1e823bf52646d033e2a6c989b24b30d5505b3b93ef8d199c245f8e27c`).
+Verify the checksum before flashing. The ROM is prepared from a clean pmOS base
+with the hardware patches applied, but has not been field-tested as a final package.
+
 See [FLASH.md](docs/FLASH.md) and [STERILE-ROM.md](docs/STERILE-ROM.md).
 
 ---
