@@ -43,6 +43,35 @@ MMIO map: [HARDWARE.md](docs/HARDWARE.md).
 
 ---
 
+## Using just the kernel / boot.img
+
+You don't need the full ROM: the repo builds the boot image on its own:
+
+```bash
+git clone -b pmos https://github.com/Fabio-San/gta4xlwifi-mainline-pmos.git
+cd gta4xlwifi-mainline-pmos
+bash scripts/setup-build-env.sh
+python3 scripts/build-upstream.py --slot boot --no-fallback \
+  --variant peripherals --persistent --jobs "$(nproc)"
+# -> artifacts/boot-upstream-peripherals-nofallback-persistent.img
+```
+
+**Important**: this is not a vanilla kernel. It uses **uniLoader**, which embeds
+the initramfs (init) **inside the kernel** — editing the outer Android ramdisk has
+no effect. The default `tools/pmos-init-aarch64` is hardcoded to mount `/dev/sda32`
+and boot postmarketOS from there. If you want a different rootfs/distro:
+- place it on `/dev/sda32` with the required firmware in `/lib/firmware`
+  (`mx140*` for WiFi, `AP_*_AUDIO_SLSI` for audio, `calliope_*` for DSP), **or**
+- replace `tools/pmos-init-aarch64` with your own init script and rebuild
+  (include a `mount --bind` on the root before `chroot` if you use systemd).
+
+Build requirements: clang/LLVM tools with unversioned symlinks, bison, path with
+**no spaces**, ~10 GB disk (see [BUILD.md](docs/BUILD.md)). Flash from recovery
+with [scripts/flash-boot-adb.ps1](scripts/flash-boot-adb.ps1); never flash
+`bootloader` or `vbmeta`.
+
+---
+
 ## Quick start
 
 ### Build the boot.img

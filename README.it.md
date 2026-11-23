@@ -31,6 +31,23 @@ Versione primaria (inglese): [README.md](README.md)
 
 ---
 
+## Usare solo il kernel / boot.img
+
+Non serve la ROM completa: il repo compila il boot.img da solo:
+
+```bash
+git clone -b pmos https://github.com/Fabio-San/gta4xlwifi-mainline-pmos.git
+cd gta4xlwifi-mainline-pmos
+bash scripts/setup-build-env.sh
+python3 scripts/build-upstream.py --slot boot --no-fallback \
+  --variant peripherals --persistent --jobs "$(nproc)"
+# -> artifacts/boot-upstream-peripherals-nofallback-persistent.img
+```
+
+**Importante**: non è un kernel vanilla. Usa **uniLoader**, che incorpora l'initramfs (init) **dentro il kernel** — modificare il ramdisk Android esterno non serve. L'init predefinito (`tools/pmos-init-aarch64`) monta `/dev/sda32` e avvia postmarketOS da lì. Per una rootfs diversa: mettila su `/dev/sda32` con i firmware necessari in `/lib/firmware` (`mx140*`, `AP_*_AUDIO_SLSI`, `calliope_*`), **oppure** sostituisci `tools/pmos-init-aarch64` con il tuo script e ricompila (con `mount --bind` prima del `chroot` se usi systemd).
+
+Build: symlink LLVM senza versione, bison, percorso **senza spazi**, ~10 GB (vedi BUILD.md). Flash da recovery con `scripts/flash-boot-adb.ps1`; mai flashare `bootloader`/`vbmeta`.
+
 ## Quick start
 
 ```bash
